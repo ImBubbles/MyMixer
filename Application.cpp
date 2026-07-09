@@ -5,6 +5,8 @@
 
 Application::Application(int argc, char *argv[]) : pipewireContext(PipeWireContext()) {
     Log::info("Application started");
-    pipewireContext.createChannel("goofy", "poop");
-    std::this_thread::sleep_for(std::chrono::seconds(10));
+    pipewireContext.createChannel("master", "Master");
+    pipewireContext.createChannel("discord", "Discord");
+    pipewireContext.linkChannels("discord", "master");
+    std::this_thread::sleep_for(std::chrono::seconds(60));
 }

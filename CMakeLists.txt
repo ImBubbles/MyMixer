@@ -11,6 +11,8 @@ add_executable(MyMixer
         Application.cpp
         Application.h
         pipewire/VirtualChannel.cpp
+        util/UtilString.cpp
+        #util/UtilNumber.cpp
 )
 
 find_package(PkgConfig REQUIRED)
