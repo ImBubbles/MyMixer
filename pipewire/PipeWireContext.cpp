@@ -123,12 +123,10 @@ bool PipeWireContext::doesChannelExist(const std::string& name) const {
 }
 
 bool PipeWireContext::createChannel(const std::string& name, const std::string& description) {
-    pw_thread_loop_lock(loop);
-
     if (doesChannelExist(name)) {
-        pw_thread_loop_unlock(loop);
         return false;
     }
+    pw_thread_loop_lock(loop);
 
     auto* channel = new VirtualChannel(core, name, description);
     virtualChannels.push_back(channel);
@@ -146,43 +144,4 @@ bool PipeWireContext::createChannel(const std::string& name, const std::string& 
     }
 
     return true;
-}
-
-VirtualChannel* PipeWireContext::findChannel(const std::string& name) const {
-    for (VirtualChannel* vc : virtualChannels) {
-        if (vc != nullptr && vc->name == name) {
-            return vc;
-        }
-    }
-    return nullptr;
-}
-
-bool PipeWireContext::linkChannels(const std::string& from, const std::string& to) {
-    pw_thread_loop_lock(loop);
-    VirtualChannel* source = findChannel(from);
-    const VirtualChannel* target = findChannel(to);
-    if (source == nullptr || target == nullptr) {
-        pw_thread_loop_unlock(loop);
-        Log::error("Cannot link channels \"" + from + "\" and \"" + to + "\": channel not found");
-        return false;
-    }
-
-    const bool result = VirtualChannel::connect(source, target);
-    pw_thread_loop_unlock(loop);
-    return result;
-}
-
-bool PipeWireContext::unlinkChannels(const std::string& from, const std::string& to) {
-    pw_thread_loop_lock(loop);
-    VirtualChannel* source = findChannel(from);
-    const VirtualChannel* target = findChannel(to);
-    if (source == nullptr || target == nullptr) {
-        pw_thread_loop_unlock(loop);
-        Log::error("Cannot unlink channels \"" + from + "\" and \"" + to + "\": channel not found");
-        return false;
-    }
-
-    const bool result = VirtualChannel::disconnect(source, target);
-    pw_thread_loop_unlock(loop);
-    return result;
 }

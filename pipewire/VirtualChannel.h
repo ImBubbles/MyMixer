@@ -10,32 +10,15 @@
 struct VirtualChannel {
     explicit VirtualChannel(pw_core* core, const std::string& name, const std::string& description);
     ~VirtualChannel();
-    static bool connect(VirtualChannel* from, const VirtualChannel* to);
-    static bool disconnect(VirtualChannel* from, const VirtualChannel* to);
-    bool waitForNodeIds() const;
     std::string name;
     std::string description;
-private:
-    static constexpr uint32_t sampleRate = 48000;
-    static constexpr uint32_t channels = 2;
 
+    static bool waitForNodeIds(pw_stream* input, pw_stream* output, const std::string& name);
+    bool waitForNodeIds() const;
+private:
     pw_core* core;
     pw_stream* input;
     pw_stream* output;
-    std::vector<pw_link*> outputLinks;
-    static const pw_stream_events inputStreamEvents;
-    static const pw_stream_events outputStreamEvents;
-    spa_hook inputListener;
-    spa_hook outputListener;
-
-    static const spa_pod* buildFormatParams(uint8_t* buffer, size_t size);
-    static void onProcess(void* userdata);
-    static void onStateChanged(
-        void* userdata,
-        enum pw_stream_state old,
-        enum pw_stream_state state,
-        const char* error
-    );
 };
 
 namespace StreamFactory {
