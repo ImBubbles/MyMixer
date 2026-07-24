@@ -10,6 +10,8 @@
 #include <unistd.h>
 #include <algorithm>
 #include <pipewire/pipewire.h>
+
+#include "StreamFactory.h"
 #include "../logger/Log.h"
 
 static void killOldProcesses() {
@@ -59,6 +61,23 @@ static void killOldProcesses() {
     closedir(procDir);
 }
 
+static void registry_global(
+    void *data,
+    uint32_t id,
+    uint32_t permissions,
+    const char *type,
+    uint32_t version,
+    const struct spa_dict *props)
+{
+    auto *ctx = static_cast<PipeWireContext *>(data);
+
+}
+
+static void registry_global_remove(void *data, const uint32_t id)
+{
+    printf("Removed object %u\n", id);
+}
+
 PipeWireContext::PipeWireContext() {
     killOldProcesses();
     Log::info("Creating PipeWireContext");
@@ -72,18 +91,29 @@ PipeWireContext::PipeWireContext() {
     loop = pw_thread_loop_new("MyMixer", nullptr);
     pw_thread_loop_start(loop);
     pw_thread_loop_lock(loop);
-
     context = pw_context_new(pw_thread_loop_get_loop(loop), nullptr, 0);
     core = pw_context_connect(context, nullptr, 0);
-
+    registry = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
+    registry_events = {
+        .version = PW_VERSION_REGISTRY_EVENTS,
+        .global = registry_global,
+        .global_remove = registry_global_remove,
+    };
+    pw_registry_add_listener(
+        registry,
+        &registry_listener,
+        &registry_events,
+        this
+        );
     pw_thread_loop_unlock(loop);
+
     Log::info("Created PipeWireContext");
 }
 
 PipeWireContext::~PipeWireContext() {
     Log::info("Destroying PipeWireContext");
 
-    pw_thread_loop_lock(loop);
+    spa_hook_remove(&registry_listener);
     for (const VirtualChannel* vc : virtualChannels) {
         if (vc == nullptr) {
             continue;
@@ -91,6 +121,9 @@ PipeWireContext::~PipeWireContext() {
         delete vc;
     }
     virtualChannels.clear();
+    pw_thread_loop_lock(loop);
+    pw_proxy_destroy(reinterpret_cast<pw_proxy *>(registry));
+    registry = nullptr;
 
     if (core != nullptr) {
         pw_core_disconnect(core);
@@ -101,7 +134,6 @@ PipeWireContext::~PipeWireContext() {
         context = nullptr;
     }
     pw_thread_loop_unlock(loop);
-
     pw_thread_loop_stop(loop);
     pw_thread_loop_destroy(loop);
     loop = nullptr;
@@ -122,26 +154,30 @@ bool PipeWireContext::doesChannelExist(const std::string& name) const {
     return false;
 }
 
-bool PipeWireContext::createChannel(const std::string& name, const std::string& description) {
-    if (doesChannelExist(name)) {
+bool PipeWireContext::registerChannel(VirtualChannel* channel) {
+    if (doesChannelExist(channel->name)) {
+        return false;
+    }
+    if (!channel->waitForNodeIds()) {
+        pw_thread_loop_lock(loop);
+        delete channel;
+        pw_thread_loop_unlock(loop);
         return false;
     }
     pw_thread_loop_lock(loop);
-
-    auto* channel = new VirtualChannel(core, name, description);
     virtualChannels.push_back(channel);
-    pw_thread_loop_unlock(loop);
+    return true;
+}
 
-    if (!channel->waitForNodeIds()) {
-        pw_thread_loop_lock(loop);
-        auto it = std::find(virtualChannels.begin(), virtualChannels.end(), channel);
-        if (it != virtualChannels.end()) {
-            virtualChannels.erase(it);
-        }
-        pw_thread_loop_unlock(loop);
-        delete channel;
+bool PipeWireContext::createChannel(const std::string& name, const std::string& description) {
+    // Also handles registering using PipeWireContext#registerChannel()
+    if (doesChannelExist(name)) {
+        // though register method also handles this, I'd rather do a name check before making a new object
         return false;
     }
+    pw_thread_loop_lock(loop);
+    auto* channel = StreamFactory::createVirtualChannel(this, name, description);
+    pw_thread_loop_unlock(loop);
 
-    return true;
+    return registerChannel(channel);
 }
