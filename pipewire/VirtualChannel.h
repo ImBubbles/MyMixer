@@ -1,69 +1,43 @@
 #pragma once
 #include <string>
-#include <vector>
 #include <pipewire/pipewire.h>
-#include <spa/param/audio/format.h>
-#include <spa/pod/builder.h>
+#include <spa/param/audio/format-utils.h>
 
 #include "../util/UtilString.h"
+#include "PipeWireContext.h"
 
-struct VirtualChannel {
-    explicit VirtualChannel(pw_core* core, const std::string& name, const std::string& description);
-    ~VirtualChannel();
-    static bool connect(VirtualChannel* from, const VirtualChannel* to);
-    static bool disconnect(VirtualChannel* from, const VirtualChannel* to);
-    bool waitForNodeIds() const;
-    std::string name;
-    std::string description;
-private:
-    static constexpr uint32_t sampleRate = 48000;
-    static constexpr uint32_t channels = 2;
+class PipeWireContext;
+struct VirtualChannel;
+struct StreamContext {
+    StreamContext(VirtualChannel* channel, pw_stream* stream, const pw_direction direction, const bool process);
+    VirtualChannel* channel;
+    struct pw_stream* stream;
 
-    pw_core* core;
-    pw_stream* input;
-    pw_stream* output;
-    std::vector<pw_link*> outputLinks;
-    static const pw_stream_events inputStreamEvents;
-    static const pw_stream_events outputStreamEvents;
-    spa_hook inputListener;
-    spa_hook outputListener;
+    uint32_t nodeId = PW_ID_ANY;
+    uint32_t leftPort = PW_ID_ANY;
+    uint32_t rightPort = PW_ID_ANY;
 
-    static const spa_pod* buildFormatParams(uint8_t* buffer, size_t size);
-    static void onProcess(void* userdata);
-    static void onStateChanged(
-        void* userdata,
-        enum pw_stream_state old,
-        enum pw_stream_state state,
-        const char* error
-    );
+    struct spa_hook listener;
+    struct pw_stream_events events;
+    ~StreamContext();
 };
 
-namespace StreamFactory {
-    static pw_stream* createInputNode(pw_core* core, const std::string& name, const std::string& description) {
-        const std::string nodeName = UtilString::asLowercase("mymixer_" + name + "_input");
-        pw_properties* props = pw_properties_new(
-            PW_KEY_NODE_NAME, nodeName.c_str(),
-            PW_KEY_NODE_DESCRIPTION, (description + " Input").c_str(),
-            PW_KEY_MEDIA_TYPE, "Audio",
-            PW_KEY_MEDIA_CATEGORY, "Playback",
-            PW_KEY_NODE_VIRTUAL, "true",
-            nullptr
-        );
+struct VirtualChannel {
+    explicit VirtualChannel(PipeWireContext* context, const std::string& name, const std::string& description, pw_stream* input, pw_stream* output);
+    ~VirtualChannel();
+    std::string name;
+    std::string description;
+    PipeWireContext* context;
 
-        return pw_stream_new(core, nodeName.c_str(), props);
-    }
+    static bool waitForNodeIds(pw_thread_loop* loop, pw_stream* source, pw_stream* sink, const std::string& name);
+    bool waitForNodeIds() const;
+    bool waitForPorts() const;
 
-    static pw_stream* createOutputNode(pw_core* core, const std::string& name, const std::string& description) {
-        const std::string nodeName = UtilString::asLowercase("mymixer_" + name + "_output");
-        pw_properties* props = pw_properties_new(
-            PW_KEY_NODE_NAME, nodeName.c_str(),
-            PW_KEY_NODE_DESCRIPTION, (description + " Output").c_str(),
-            PW_KEY_MEDIA_TYPE, "Audio",
-            PW_KEY_MEDIA_CATEGORY, "Capture",
-            PW_KEY_NODE_VIRTUAL, "true",
-            nullptr
-        );
-
-        return pw_stream_new(core, nodeName.c_str(), props);
-    }
-}
+    const StreamContext* getSource() const;
+    const StreamContext* getSink() const;
+    bool connect(VirtualChannel* from, const VirtualChannel* to);
+    std::vector<struct pw_link*> outputLinks;
+private:
+    StreamContext* source;
+    StreamContext* sink;
+};

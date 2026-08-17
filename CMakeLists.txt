@@ -12,6 +12,7 @@ add_executable(MyMixer
         Application.h
         pipewire/VirtualChannel.cpp
         util/UtilString.cpp
+        pipewire/StreamFactory.h
         #util/UtilNumber.cpp
 )
 

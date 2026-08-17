@@ -1,36 +1,188 @@
 #include "VirtualChannel.h"
 #include "../logger/Log.h"
 
-#include <pipewire/keys.h>
-#include <pipewire/link.h>
-#include <pipewire/properties.h>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include "StreamFactory.h"
 
-static bool waitForStreamNodeIds(pw_stream* input, pw_stream* output, const std::string& name) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+static void stream_process(void *data)
+{
+    auto *channel = static_cast<VirtualChannel *>(data);
 
-    while ((pw_stream_get_node_id(input) == PW_ID_ANY || pw_stream_get_node_id(output) == PW_ID_ANY) &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    pw_buffer *inBuffer = pw_stream_dequeue_buffer(channel->getSource()->stream);
+
+    if (inBuffer == nullptr) {
+        return;
     }
 
-    const bool ready = pw_stream_get_node_id(input) != PW_ID_ANY && pw_stream_get_node_id(output) != PW_ID_ANY;
-    if (!ready) {
-        Log::error("Channel \"" + name + "\" node ids are not available yet");
+    pw_buffer *outBuffer = pw_stream_dequeue_buffer(channel->getSink()->stream);
+
+    if (outBuffer == nullptr) {
+        pw_stream_queue_buffer(channel->getSource()->stream, inBuffer);
+        return;
     }
-    return ready;
+
+
+    spa_data *inData = &inBuffer->buffer->datas[0];
+
+    spa_data *outData = &outBuffer->buffer->datas[0];
+
+
+    // assuming float audio
+    float *input = static_cast<float *>(inData->data);
+
+    float *output = static_cast<float *>(outData->data);
+
+
+    uint32_t samples = inData->chunk->size / sizeof(float);
+
+
+    memcpy(
+        output,
+        input,
+        samples * sizeof(float)
+    );
+
+
+    outData->chunk->size =
+        inData->chunk->size;
+
+
+    pw_stream_queue_buffer(
+        channel->getSource()->stream,
+        inBuffer
+    );
+
+    pw_stream_queue_buffer(
+        channel->getSink()->stream,
+        outBuffer
+    );
+}
+
+static void stream_state_changed(
+    void *data,
+    enum pw_stream_state old_state,
+    enum pw_stream_state state,
+    const char *error)
+{
+    auto *channel = static_cast<VirtualChannel *>(data);
+
+    if (error != nullptr) {
+        Log::error("Stream error: " + std::string(error));
+    }
+    Log::debug(
+        "Channel \"" + channel->name +
+        "\" stream state: " +
+        std::string(pw_stream_state_as_string(state))
+    );
+
+    pw_thread_loop_signal(channel->context->loop, false);
+}
+
+StreamContext::StreamContext(VirtualChannel* channel, pw_stream* stream, const pw_direction direction, const bool process)
+    :
+    channel(channel), stream(stream) {
+    events = {
+        .version = PW_VERSION_STREAM_EVENTS,
+        .state_changed = stream_state_changed,
+    };
+    if (process) {
+        events.process = stream_process;
+    }
+    pw_thread_loop_lock(channel->context->loop);
+    // Listener
+    pw_stream_add_listener(
+        stream,
+        &listener,
+        &events,
+        channel
+        );
+    // Parameters
+    uint8_t buffer[1024];
+
+    auto builder =
+        SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    const auto* info = StreamFactory::createAudioInfoRawDefault();
+    const spa_pod *params[1];
+    params[0] = spa_format_audio_raw_build(
+        &builder,
+        SPA_PARAM_EnumFormat,
+        info
+    );
+    // Connect using params
+    if (pw_stream_connect(
+        stream,
+        direction,
+        PW_ID_ANY,
+        static_cast<pw_stream_flags>(
+            PW_STREAM_FLAG_MAP_BUFFERS
+        ),
+        params,
+        1) < 0) {
+        Log::error("Failed to connect source stream");
+        }
+    pw_thread_loop_unlock(channel->context->loop);
+}
+StreamContext::~StreamContext() {
+    Log::info("Destroying stream");
+    if (stream == nullptr) {
+        return;
+    }
+    pw_thread_loop_lock(channel->context->loop);
+    spa_hook_remove(&listener);
+    pw_stream_disconnect(stream);
+    pw_stream_destroy(stream);
+    stream = nullptr;
+    pw_thread_loop_unlock(channel->context->loop);
+    Log::info("Destroyed stream");
+}
+
+VirtualChannel::VirtualChannel(PipeWireContext* context, const std::string& name, const std::string& description, pw_stream* source, pw_stream* sink) :
+    name(name),
+    description(description),
+    context(context),
+    source(new StreamContext(this, source, PW_DIRECTION_INPUT, true)),
+    sink(new StreamContext(this, sink, PW_DIRECTION_OUTPUT, false))
+{
+    Log::info(
+        "Channel \"" + name + "\" created with source node \"" + name + "_source\" and sink node \"" +
+        name + "_sink\""
+    );
+}
+
+VirtualChannel::~VirtualChannel() {
+    Log::info("Destroying virtual channel \"" + name + "\"");
+    // Destroy any created links
+    if (!outputLinks.empty()) {
+        pw_thread_loop_lock(context->loop);
+        for (pw_link* link : outputLinks) {
+            if (link != nullptr) {
+                pw_core_destroy(context->core, link);
+            }
+        }
+        outputLinks.clear();
+        pw_thread_loop_unlock(context->loop);
+    }
+
+    delete source;
+    source = nullptr;
+    delete sink;
+    sink = nullptr;
+    Log::info("Destroyed virtual channel \"" + name + "\"");
 }
 
 bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) {
-    if (from->core != to->core) {
+    if (from->context->core != to->context->core) {
         Log::error("Cannot link channels \"" + from->name + "\" and \"" + to->name + "\": different PipeWire cores");
         return false;
     }
 
-    if (from->output == nullptr || to->input == nullptr) {
+    const StreamContext* fromSink = from->getSink();
+    const StreamContext* toSource = to->getSource();
+
+    if (fromSink == nullptr || toSource == nullptr) {
         Log::error("Cannot link channels \"" + from->name + "\" and \"" + to->name + "\": stream not initialized");
         return false;
     }
@@ -40,12 +192,12 @@ bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) {
         return false;
     }
 
-    if (!waitForStreamNodeIds(from->output, to->input, from->name)) {
+    if (!waitForNodeIds(context->loop, fromSink->stream, toSource->stream, from->name)) {
         return false;
     }
 
-    const uint32_t outputNodeId = pw_stream_get_node_id(from->output);
-    const uint32_t inputNodeId = pw_stream_get_node_id(to->input);
+    const uint32_t outputNodeId = pw_stream_get_node_id(fromSink->stream);
+    const uint32_t inputNodeId = pw_stream_get_node_id(toSource->stream);
     const char* portNames[2][2] = {
         { "output_FL", "input_FL" },
         { "output_FR", "input_FR" }
@@ -65,14 +217,16 @@ bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) {
             break;
         }
 
+        pw_thread_loop_lock(context->loop);
         auto* link = static_cast<pw_link*>(pw_core_create_object(
-            from->core,
+            context->core,
             "link-factory",
             PW_TYPE_INTERFACE_Link,
             PW_VERSION_LINK,
             &props->dict,
             0
         ));
+        pw_thread_loop_unlock(context->loop);
         pw_properties_free(props);
 
         if (link == nullptr) {
@@ -84,10 +238,15 @@ bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) {
     }
 
     if (from->outputLinks.size() != 2) {
+        // cleanup
+        pw_thread_loop_lock(context->loop);
         for (pw_link* link : from->outputLinks) {
-            pw_core_destroy(from->core, link);
+            if (link != nullptr) {
+                pw_core_destroy(context->core, link);
+            }
         }
         from->outputLinks.clear();
+        pw_thread_loop_unlock(context->loop);
         return false;
     }
 
@@ -95,192 +254,70 @@ bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) {
     return true;
 }
 
-bool VirtualChannel::disconnect(VirtualChannel* from, const VirtualChannel* to) {
-    if (from->core != to->core) {
-        Log::error("Cannot unlink channels \"" + from->name + "\" and \"" + to->name + "\": different PipeWire cores");
-        return false;
+bool VirtualChannel::waitForNodeIds(pw_thread_loop* loop, pw_stream* source, pw_stream* sink, const std::string& name) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+
+    pw_thread_loop_lock(loop);
+    while ((pw_stream_get_node_id(source) == PW_ID_ANY || pw_stream_get_node_id(sink) == PW_ID_ANY) && std::chrono::steady_clock::now() < deadline) {
+        pw_thread_loop_wait(loop);
     }
+    pw_thread_loop_unlock(loop);
 
-    if (from->output == nullptr || to->input == nullptr) {
-        Log::error("Cannot unlink channels \"" + from->name + "\" and \"" + to->name + "\": stream not initialized");
-        return false;
-    }
-
-    if (from->outputLinks.empty()) {
-        Log::warning("No existing links to disconnect for channel \"" + from->name + "\"");
-        return false;
-    }
-
-    for (pw_link* link : from->outputLinks) {
-        if (link != nullptr) {
-            pw_core_destroy(from->core, link);
-        }
-    }
-    from->outputLinks.clear();
-
-    Log::info("Unlinked channel \"" + from->name + "\" -> \"" + to->name + "\"");
-    return true;
-}
-
-const pw_stream_events VirtualChannel::inputStreamEvents = {
-    .version = PW_VERSION_STREAM_EVENTS,
-    .state_changed = VirtualChannel::onStateChanged,
-    .process = VirtualChannel::onProcess,
-};
-
-const pw_stream_events VirtualChannel::outputStreamEvents = {
-    .version = PW_VERSION_STREAM_EVENTS,
-    .state_changed = VirtualChannel::onStateChanged,
-};
-
-bool VirtualChannel::waitForNodeIds() const {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-
-    while ((pw_stream_get_node_id(input) == PW_ID_ANY || pw_stream_get_node_id(output) == PW_ID_ANY) &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    const bool ready = pw_stream_get_node_id(input) != PW_ID_ANY && pw_stream_get_node_id(output) != PW_ID_ANY;
+    const bool ready = pw_stream_get_node_id(source) != PW_ID_ANY && pw_stream_get_node_id(sink) != PW_ID_ANY;
     if (!ready) {
         Log::error("Channel \"" + name + "\" node ids are not available yet");
     }
     return ready;
 }
 
-const spa_pod* VirtualChannel::buildFormatParams(uint8_t* buffer, const size_t size) {
-    spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, static_cast<uint32_t>(size));
-
-    return static_cast<const spa_pod*>(spa_pod_builder_add_object(
-        &builder,
-        SPA_TYPE_OBJECT_Format,
-        SPA_PARAM_EnumFormat,
-        SPA_FORMAT_mediaType,
-        SPA_POD_Id(SPA_MEDIA_TYPE_audio),
-        SPA_FORMAT_mediaSubtype,
-        SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-        SPA_FORMAT_AUDIO_format,
-        SPA_POD_Id(SPA_AUDIO_FORMAT_F32_LE),
-        SPA_FORMAT_AUDIO_channels,
-        SPA_POD_Int(channels),
-        SPA_FORMAT_AUDIO_rate,
-        SPA_POD_Int(sampleRate)
-    ));
+bool VirtualChannel::waitForNodeIds() const {
+    const bool result = waitForNodeIds(context->loop, source->stream, sink->stream, name);
+    if (result) {
+        source->nodeId = pw_stream_get_node_id(source->stream);
+        Log::debug(name + " source has node id of " + std::to_string(source->nodeId));
+        sink->nodeId = pw_stream_get_node_id(sink->stream);
+        Log::debug(name + " sink has node id of " + std::to_string(sink->nodeId));
+    }
+    return result;
 }
 
-VirtualChannel::VirtualChannel(pw_core* core, const std::string& name, const std::string& description) :
-    name(name),
-    description(description),
-    core(core),
-    input(StreamFactory::createInputNode(core, name, description)),
-    output(StreamFactory::createOutputNode(core, name, description))
-{
-    uint8_t buffer[1024];
-    const spa_pod* params[] = { buildFormatParams(buffer, sizeof(buffer)) };
-    const enum pw_stream_flags flags = static_cast<enum pw_stream_flags>(
-        PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS
-    );
+bool VirtualChannel::waitForPorts() const {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
 
-    pw_stream_add_listener(input, &inputListener, &inputStreamEvents, this);
-    pw_stream_add_listener(output, &outputListener, &outputStreamEvents, this);
+    pw_thread_loop_lock(context->loop);
 
-    if (pw_stream_connect(input, PW_DIRECTION_INPUT, PW_ID_ANY, flags, params, 1) < 0) {
-        Log::error("Failed to connect input node for channel \"" + name + "\"");
+    while (
+        (source->leftPort == PW_ID_ANY ||
+         source->rightPort == PW_ID_ANY ||
+         sink->leftPort == PW_ID_ANY ||
+         sink->rightPort == PW_ID_ANY) &&
+        std::chrono::steady_clock::now() < deadline
+    ) {
+        pw_thread_loop_wait(context->loop);
     }
 
-    if (pw_stream_connect(output, PW_DIRECTION_OUTPUT, PW_ID_ANY, flags, params, 1) < 0) {
-        Log::error("Failed to connect output node for channel \"" + name + "\"");
+    pw_thread_loop_unlock(context->loop);
+
+    const bool ready =
+        source->leftPort != PW_ID_ANY &&
+        source->rightPort != PW_ID_ANY &&
+        sink->leftPort != PW_ID_ANY &&
+        sink->rightPort != PW_ID_ANY;
+
+    if (!ready) {
+        Log::error(
+            "Channel \"" + name +
+            "\" ports are not available yet"
+        );
     }
 
-    Log::info(
-        "Channel \"" + name + "\" created with input node \"" + name + "_input\" and output node \"" +
-        name + "_output\""
-    );
+    return ready;
 }
 
-VirtualChannel::~VirtualChannel() {
-    Log::info("Destroying virtual channel \"" + name + "\"");
-    for (pw_link* link : outputLinks) {
-        if (link != nullptr) {
-            pw_core_destroy(core, link);
-        }
-    }
-    outputLinks.clear();
-
-    if (input != nullptr) {
-        pw_stream_destroy(input);
-        input = nullptr;
-    }
-    if (output != nullptr) {
-        pw_stream_destroy(output);
-        output = nullptr;
-    }
-    Log::info("Destroyed virtual channel \"" + name + "\"");
+const StreamContext* VirtualChannel::getSource() const {
+    return source;
 }
-
-void VirtualChannel::onProcess(void* userdata) {
-    auto* channel = static_cast<VirtualChannel*>(userdata);
-
-    pw_buffer* inBuffer = pw_stream_dequeue_buffer(channel->input);
-    if (inBuffer == nullptr) {
-        return;
-    }
-
-    pw_buffer* outBuffer = pw_stream_dequeue_buffer(channel->output);
-    if (outBuffer == nullptr) {
-        pw_stream_queue_buffer(channel->input, inBuffer);
-        return;
-    }
-
-    spa_buffer* inSpa = inBuffer->buffer;
-    spa_buffer* outSpa = outBuffer->buffer;
-
-    spa_data* inData = &inSpa->datas[0];
-    spa_data* outData = &outSpa->datas[0];
-
-    if (inData->data != nullptr && outData->data != nullptr && inData->chunk != nullptr && outData->chunk != nullptr) {
-        const uint32_t size = std::min(inData->chunk->size, outData->maxsize);
-        std::memcpy(outData->data, inData->data, size);
-        outData->chunk->offset = 0;
-        outData->chunk->size = size;
-        outData->chunk->stride = inData->chunk->stride;
-    }
-
-    pw_stream_queue_buffer(channel->input, inBuffer);
-    pw_stream_queue_buffer(channel->output, outBuffer);
-}
-
-void VirtualChannel::onStateChanged(
-    void* userdata,
-    enum pw_stream_state old,
-    enum pw_stream_state state,
-    const char* error
-) {
-    (void)old;
-
-    auto* channel = static_cast<VirtualChannel*>(userdata);
-
-    switch (state) {
-        case PW_STREAM_STATE_ERROR:
-            Log::error(
-                channel->name + " stream error: " +
-                std::string(error != nullptr ? error : "unknown")
-            );
-            break;
-
-        case PW_STREAM_STATE_CONNECTING:
-            Log::debug(channel->name + " connecting");
-            break;
-
-        case PW_STREAM_STATE_PAUSED:
-            Log::debug(channel->name + " paused");
-            break;
-
-        case PW_STREAM_STATE_STREAMING:
-            Log::debug(channel->name + " streaming");
-            break;
-
-        default:
-            break;
-    }
+const StreamContext* VirtualChannel::getSink() const {
+    return sink;
 }
