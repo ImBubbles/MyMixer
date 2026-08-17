@@ -70,13 +70,55 @@ static void registry_global(
     const struct spa_dict *props)
 {
     auto *ctx = static_cast<PipeWireContext *>(data);
+    if (strcmp(type, PW_TYPE_INTERFACE_Port) == 0) {
+        const char* nodeIdStr = spa_dict_lookup(props, PW_KEY_NODE_ID);
+        if (nodeIdStr == nullptr)
+            return;
 
+        uint32_t nodeId = std::stoul(nodeIdStr);
+        StreamContext* stream = ctx->findStreamContext(nodeId);
+        if (stream == nullptr)
+            return;
+
+        const char* channel = spa_dict_lookup(props, "audio.channel");
+        if (channel == nullptr)
+            return;
+
+        if (strcmp(channel, "FL") == 0) {
+            stream->leftPort = id;
+        } else if (strcmp(channel, "FR") == 0) {
+            stream->rightPort = id;
+        }
+        Log::debug("Set port " + std::to_string(id) + " for node " + std::to_string(nodeId) + " channel " + std::string(channel));
+        pw_thread_loop_signal(ctx->loop, false);
+        return;
+    }
+
+    if (strcmp(type, PW_TYPE_INTERFACE_Link) == 0) {
+        const char* outNodeStr = spa_dict_lookup(props, "link.output.node");
+        const char* outPortStr = spa_dict_lookup(props, "link.output.port");
+        const char* inNodeStr = spa_dict_lookup(props, "link.input.node");
+        const char* inPortStr = spa_dict_lookup(props, "link.input.port");
+
+        if (outNodeStr && outPortStr && inNodeStr && inPortStr) {
+            uint32_t outNode = std::stoul(outNodeStr);
+            uint32_t outPort = std::stoul(outPortStr);
+            uint32_t inNode = std::stoul(inNodeStr);
+            uint32_t inPort = std::stoul(inPortStr);
+            Log::info("Registry: link " + std::to_string(id) + " -> " + std::to_string(outNode) + ":" + std::to_string(outPort) + " -> " + std::to_string(inNode) + ":" + std::to_string(inPort));
+        } else {
+            Log::debug("Registry: link object " + std::to_string(id) + " published (partial props)");
+        }
+        return;
+    }
 }
 
 static void registry_global_remove(void *data, const uint32_t id)
 {
-    printf("Removed object %u\n", id);
+    //printf("Removed object %u\n", id);
 }
+
+
 
 PipeWireContext::PipeWireContext() {
     killOldProcesses();
@@ -122,6 +164,7 @@ PipeWireContext::~PipeWireContext() {
     }
     virtualChannels.clear();
     pw_thread_loop_lock(loop);
+    // (no debug proxy retention to clean up)
     pw_proxy_destroy(reinterpret_cast<pw_proxy *>(registry));
     registry = nullptr;
 
@@ -154,30 +197,180 @@ bool PipeWireContext::doesChannelExist(const std::string& name) const {
     return false;
 }
 
-bool PipeWireContext::registerChannel(VirtualChannel* channel) {
+VirtualChannel* PipeWireContext::registerChannel(VirtualChannel* channel) {
+    pw_thread_loop_lock(loop);
     if (doesChannelExist(channel->name)) {
-        return false;
+        pw_thread_loop_unlock(loop);
+        return nullptr;
     }
-    if (!channel->waitForNodeIds()) {
+    /* Add early so registry events can find the StreamContext while ports are published. */
+    virtualChannels.push_back(channel);
+    pw_thread_loop_unlock(loop);
+
+    if (!channel->waitForNodeIds() || !channel->waitForPorts()) {
         pw_thread_loop_lock(loop);
+        /* Remove from list and cleanup */
+        auto it = std::find(virtualChannels.begin(), virtualChannels.end(), channel);
+        if (it != virtualChannels.end())
+            virtualChannels.erase(it);
         delete channel;
         pw_thread_loop_unlock(loop);
-        return false;
+        Log::error("Either nodes or ports failed to resolve.");
+        return nullptr;
     }
-    pw_thread_loop_lock(loop);
-    virtualChannels.push_back(channel);
-    return true;
+
+    return channel;
 }
 
-bool PipeWireContext::createChannel(const std::string& name, const std::string& description) {
+VirtualChannel* PipeWireContext::createChannel(const std::string& name, const std::string& description) {
     // Also handles registering using PipeWireContext#registerChannel()
     if (doesChannelExist(name)) {
         // though register method also handles this, I'd rather do a name check before making a new object
-        return false;
+        return nullptr;
     }
-    pw_thread_loop_lock(loop);
     auto* channel = StreamFactory::createVirtualChannel(this, name, description);
-    pw_thread_loop_unlock(loop);
 
     return registerChannel(channel);
+}
+
+// TODO Unsure if this method works
+bool PipeWireContext::linkPorts(const uint32_t outputNode, const uint32_t outputPort,
+    const uint32_t inputNode, const uint32_t inputPort) const {
+
+    pw_thread_loop_lock(loop);
+
+    std::string linkOutputNode = std::to_string(outputNode);
+    std::string linkOutputPort = std::to_string(outputPort);
+    std::string linkInputNode = std::to_string(inputNode);
+    std::string linkInputPort = std::to_string(inputPort);
+
+    Log::debug("Creating link with properties: output=" + linkOutputNode + ":" + linkOutputPort + " input=" + linkInputNode + ":" + linkInputPort);
+
+    // Try creating link properties using the standard PW_KEY_LINK_* keys
+    pw_properties* props = pw_properties_new(
+        PW_KEY_LINK_OUTPUT_NODE, linkOutputNode.c_str(),
+        PW_KEY_LINK_OUTPUT_PORT, linkOutputPort.c_str(),
+        PW_KEY_LINK_INPUT_NODE, linkInputNode.c_str(),
+        PW_KEY_LINK_INPUT_PORT, linkInputPort.c_str(),
+        nullptr
+    );
+
+    if (props == nullptr) {
+        pw_thread_loop_unlock(loop);
+        Log::error("Failed to create link properties");
+        return false;
+    }
+
+    // Attempt to create the link via link-factory and interpret as a pw_link*
+    void* raw_link = pw_core_create_object(
+        core,
+        "link-factory",
+        PW_TYPE_INTERFACE_Link,
+        PW_VERSION_LINK,
+        &props->dict,
+        0
+    );
+
+    pw_properties_free(props);
+
+    pw_thread_loop_unlock(loop);
+
+    if (raw_link == nullptr) {
+        Log::error("Failed to create PipeWire link using PW_KEY_LINK_* keys");
+        return false;
+    }
+
+    Log::info("Link created");
+
+    return true;
+}
+
+// TODO Unsure if this method works
+bool PipeWireContext::linkPortsLR(const uint32_t outputNode, const uint32_t outputL, const uint32_t outputR,
+    const uint32_t inputNode, const uint32_t inputL, const uint32_t inputR) const {
+    return linkPorts(outputNode, outputL, inputNode, inputL) && linkPorts(outputNode, outputR, inputNode, inputR);
+}
+
+// This works
+bool PipeWireContext::linkStreams(const StreamContext* source, const StreamContext* sink) const {
+    // Prefer using the stream's node id and named ports instead of raw port ids.
+    // This attempts to create links that reference exported port names from streams.
+    uint32_t outputNodeId = pw_stream_get_node_id(source->stream);
+    uint32_t inputNodeId = pw_stream_get_node_id(sink->stream);
+
+    Log::debug("linkStreams using node ids from streams: out=" + std::to_string(outputNodeId) + " in=" + std::to_string(inputNodeId));
+
+    const char* portNames[2][2] = {
+        { "output_FL", "input_FL" },
+        { "output_FR", "input_FR" }
+    };
+
+    bool ok = true;
+    for (int channel = 0; channel < 2; ++channel) {
+        pw_thread_loop_lock(loop);
+        pw_properties* props = pw_properties_new(
+            PW_KEY_LINK_OUTPUT_NODE, std::to_string(outputNodeId).c_str(),
+            PW_KEY_LINK_INPUT_NODE, std::to_string(inputNodeId).c_str(),
+            PW_KEY_LINK_OUTPUT_PORT, portNames[channel][0],
+            PW_KEY_LINK_INPUT_PORT, portNames[channel][1],
+            nullptr
+        );
+
+        if (props == nullptr) {
+            pw_thread_loop_unlock(loop);
+            Log::error("Failed to create link properties for channel " + std::to_string(channel));
+            ok = false;
+            continue;
+        }
+
+        void* raw_link = pw_core_create_object(
+            core,
+            "link-factory",
+            PW_TYPE_INTERFACE_Link,
+            PW_VERSION_LINK,
+            &props->dict,
+            0
+        );
+        pw_properties_free(props);
+        pw_thread_loop_unlock(loop);
+
+        if (raw_link == nullptr) {
+            Log::error("Failed to create PipeWire link for channel " + std::to_string(channel));
+            ok = false;
+            continue;
+        }
+
+        Log::info("Link created for channel " + std::to_string(channel));
+    }
+
+    return ok;
+}
+
+bool PipeWireContext::linkChannels(const VirtualChannel* source, const VirtualChannel* sink) const {
+    Log::debug("linkChannels: source='" + source->name + "' sink='" + sink->name + "'");
+    // Use VirtualChannel::connect which implements the link-factory usage
+    // with named port properties and manages pw_link lifetimes.
+    auto* nonConstSource = const_cast<VirtualChannel*>(source);
+    return nonConstSource->connect(nonConstSource, sink);
+}
+
+StreamContext* PipeWireContext::findStreamContext(uint32_t nodeId) const {
+    for (VirtualChannel* channel : virtualChannels) {
+        if (channel == nullptr)
+            continue;
+
+        auto* source =
+            const_cast<StreamContext*>(channel->getSource());
+
+        auto* sink =
+            const_cast<StreamContext*>(channel->getSink());
+
+        if (source->nodeId == nodeId)
+            return source;
+
+        if (sink->nodeId == nodeId)
+            return sink;
+    }
+
+    return nullptr;
 }
