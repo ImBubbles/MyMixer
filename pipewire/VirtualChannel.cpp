@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <utility>
 #include "StreamFactory.h"
 
 static void stream_process(void *data)
@@ -154,23 +155,33 @@ VirtualChannel::VirtualChannel(PipeWireContext* context, const std::string& name
 
 VirtualChannel::~VirtualChannel() {
     Log::info("Destroying virtual channel \"" + name + "\"");
-    // Destroy any created links
-    if (!outputLinks.empty()) {
-        pw_thread_loop_lock(context->loop);
-        for (pw_link* link : outputLinks) {
-            if (link != nullptr) {
-                pw_core_destroy(context->core, link);
-            }
-        }
-        outputLinks.clear();
-        pw_thread_loop_unlock(context->loop);
-    }
+    clearConnections();
 
     delete source;
     source = nullptr;
     delete sink;
     sink = nullptr;
     Log::info("Destroyed virtual channel \"" + name + "\"");
+}
+
+void VirtualChannel::clearConnections() {
+    if (outputLinks.empty()) {
+        return;
+    }
+
+    pw_thread_loop_lock(context->loop);
+    for (const auto& outputLink : outputLinks) {
+        if (outputLink == nullptr) {
+            continue;
+        }
+        for (pw_link* link : outputLink->links) {
+            if (link != nullptr) {
+                pw_core_destroy(context->core, link);
+            }
+        }
+    }
+    pw_thread_loop_unlock(context->loop);
+    outputLinks.clear();
 }
 
 bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) const {
@@ -187,21 +198,28 @@ bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) con
         return false;
     }
 
-    if (!from->outputLinks.empty()) {
-        Log::error("Cannot link channel \"" + from->name + "\": output is already linked");
-        return false;
+    for (const auto& outputLink : from->outputLinks) {
+        if (outputLink != nullptr && outputLink->to == to->name) {
+            Log::error("Cannot link channel \"" + from->name + "\" to \"" + to->name + "\": route already exists");
+            return false;
+        }
     }
 
-    if (!waitForNodeIds(context->loop, fromSink->stream, toSource->stream, from->name)) {
+    if (!waitForNodeIds(from->context->loop, fromSink->stream, toSource->stream, from->name)) {
         return false;
     }
 
     const uint32_t outputNodeId = pw_stream_get_node_id(fromSink->stream);
     const uint32_t inputNodeId = pw_stream_get_node_id(toSource->stream);
+
     const char* portNames[2][2] = {
         { "output_FL", "input_FL" },
         { "output_FR", "input_FR" }
     };
+    from->outputLinks.reserve(from->outputLinks.size() + 1);
+    auto outputLink = std::make_unique<OutputLink>();
+    outputLink->from = from->name;
+    outputLink->to = to->name;
 
     for (int channel = 0; channel < 2; ++channel) {
         pw_properties* props = pw_properties_new(
@@ -217,39 +235,36 @@ bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) con
             break;
         }
 
-        pw_thread_loop_lock(context->loop);
-        auto* link = static_cast<pw_link*>(pw_core_create_object(
-            context->core,
+        pw_thread_loop_lock(from->context->loop);
+        outputLink->links[channel] = static_cast<pw_link*>(pw_core_create_object(
+            from->context->core,
             "link-factory",
             PW_TYPE_INTERFACE_Link,
             PW_VERSION_LINK,
             &props->dict,
             0
         ));
-        pw_thread_loop_unlock(context->loop);
+        pw_thread_loop_unlock(from->context->loop);
         pw_properties_free(props);
 
-        if (link == nullptr) {
+        if (outputLink->links[channel] == nullptr) {
             Log::error("Failed to create PipeWire link for stereo channel " + std::to_string(channel) + " from \"" + from->name + "\" to \"" + to->name + "\"");
             break;
         }
-
-        from->outputLinks.push_back(link);
     }
 
-    if (from->outputLinks.size() != 2) {
-        // cleanup
-        pw_thread_loop_lock(context->loop);
-        for (pw_link* link : from->outputLinks) {
+    if (outputLink->links[0] == nullptr || outputLink->links[1] == nullptr) {
+        pw_thread_loop_lock(from->context->loop);
+        for (pw_link* link : outputLink->links) {
             if (link != nullptr) {
-                pw_core_destroy(context->core, link);
+                pw_core_destroy(from->context->core, link);
             }
         }
-        from->outputLinks.clear();
-        pw_thread_loop_unlock(context->loop);
+        pw_thread_loop_unlock(from->context->loop);
         return false;
     }
 
+    from->outputLinks.push_back(std::move(outputLink));
     Log::info("Linked channel \"" + from->name + "\" -> \"" + to->name + "\" via PipeWire stereo links");
     return true;
 }

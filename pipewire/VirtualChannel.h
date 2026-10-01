@@ -1,5 +1,8 @@
 #pragma once
+#include <array>
+#include <memory>
 #include <string>
+#include <vector>
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
 
@@ -22,6 +25,8 @@ struct StreamContext {
     ~StreamContext();
 };
 
+struct OutputLink;
+
 struct VirtualChannel {
     explicit VirtualChannel(PipeWireContext* context, const std::string& name, const std::string& description, pw_stream* input, pw_stream* output);
     ~VirtualChannel();
@@ -36,8 +41,15 @@ struct VirtualChannel {
     const StreamContext* getSource() const;
     const StreamContext* getSink() const;
     bool connect(VirtualChannel* from, const VirtualChannel* to) const;
-    std::vector<struct pw_link*> outputLinks;
+    void clearConnections();
+    std::vector<std::unique_ptr<OutputLink>> outputLinks;
 private:
     StreamContext* source;
     StreamContext* sink;
+};
+
+struct OutputLink {
+    std::string from;
+    std::string to;
+    std::array<pw_link*, 2> links{};
 };

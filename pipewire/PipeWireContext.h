@@ -31,10 +31,14 @@ public:
     struct pw_registry_events registry_events;
 
     StreamContext* findStreamContext(uint32_t nodeId) const;
+
+    std::vector<VirtualChannel*> getChannels() const;
 private:
+    friend struct ConfigHandler;
 
     std::vector<VirtualChannel*> virtualChannels;
     // (removed debug proxy retention) 
 
     bool doesChannelExist(const std::string& name) const;
+    bool removeChannel(const std::string& name);
 };

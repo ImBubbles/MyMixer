@@ -201,6 +201,7 @@ VirtualChannel* PipeWireContext::registerChannel(VirtualChannel* channel) {
     pw_thread_loop_lock(loop);
     if (doesChannelExist(channel->name)) {
         pw_thread_loop_unlock(loop);
+        delete channel;
         return nullptr;
     }
     /* Add early so registry events can find the StreamContext while ports are published. */
@@ -209,17 +210,36 @@ VirtualChannel* PipeWireContext::registerChannel(VirtualChannel* channel) {
 
     if (!channel->waitForNodeIds() || !channel->waitForPorts()) {
         pw_thread_loop_lock(loop);
-        /* Remove from list and cleanup */
         auto it = std::find(virtualChannels.begin(), virtualChannels.end(), channel);
-        if (it != virtualChannels.end())
+        if (it != virtualChannels.end()) {
             virtualChannels.erase(it);
-        delete channel;
+        }
         pw_thread_loop_unlock(loop);
+        delete channel;
         Log::error("Either nodes or ports failed to resolve.");
         return nullptr;
     }
 
     return channel;
+}
+
+bool PipeWireContext::removeChannel(const std::string& name) {
+    VirtualChannel* channel = nullptr;
+    pw_thread_loop_lock(loop);
+    const auto it = std::find_if(virtualChannels.begin(), virtualChannels.end(), [&name](const VirtualChannel* candidate) {
+        return candidate != nullptr && candidate->name == name;
+    });
+    if (it != virtualChannels.end()) {
+        channel = *it;
+        virtualChannels.erase(it);
+    }
+    pw_thread_loop_unlock(loop);
+
+    if (channel == nullptr) {
+        return false;
+    }
+    delete channel;
+    return true;
 }
 
 VirtualChannel* PipeWireContext::createChannel(const std::string& name, const std::string& description) {
@@ -293,57 +313,17 @@ bool PipeWireContext::linkPortsLR(const uint32_t outputNode, const uint32_t outp
 
 // This works
 bool PipeWireContext::linkStreams(const StreamContext* source, const StreamContext* sink) const {
-    // Prefer using the stream's node id and named ports instead of raw port ids.
-    // This attempts to create links that reference exported port names from streams.
-    uint32_t outputNodeId = pw_stream_get_node_id(source->stream);
-    uint32_t inputNodeId = pw_stream_get_node_id(sink->stream);
-
-    Log::debug("linkStreams using node ids from streams: out=" + std::to_string(outputNodeId) + " in=" + std::to_string(inputNodeId));
-
-    const char* portNames[2][2] = {
-        { "output_FL", "input_FL" },
-        { "output_FR", "input_FR" }
-    };
-
-    bool ok = true;
-    for (int channel = 0; channel < 2; ++channel) {
-        pw_thread_loop_lock(loop);
-        pw_properties* props = pw_properties_new(
-            PW_KEY_LINK_OUTPUT_NODE, std::to_string(outputNodeId).c_str(),
-            PW_KEY_LINK_INPUT_NODE, std::to_string(inputNodeId).c_str(),
-            PW_KEY_LINK_OUTPUT_PORT, portNames[channel][0],
-            PW_KEY_LINK_INPUT_PORT, portNames[channel][1],
-            nullptr
-        );
-
-        if (props == nullptr) {
-            pw_thread_loop_unlock(loop);
-            Log::error("Failed to create link properties for channel " + std::to_string(channel));
-            ok = false;
-            continue;
-        }
-
-        void* raw_link = pw_core_create_object(
-            core,
-            "link-factory",
-            PW_TYPE_INTERFACE_Link,
-            PW_VERSION_LINK,
-            &props->dict,
-            0
-        );
-        pw_properties_free(props);
-        pw_thread_loop_unlock(loop);
-
-        if (raw_link == nullptr) {
-            Log::error("Failed to create PipeWire link for channel " + std::to_string(channel));
-            ok = false;
-            continue;
-        }
-
-        Log::info("Link created for channel " + std::to_string(channel));
+    if (source == nullptr || sink == nullptr || source->channel == nullptr || sink->channel == nullptr) {
+        Log::error("Cannot link streams without owning channels");
+        return false;
     }
 
-    return ok;
+    if (source->channel->getSink() != source || sink->channel->getSource() != sink) {
+        Log::error("Cannot link streams that are not a channel sink-to-source pair");
+        return false;
+    }
+
+    return linkChannels(source->channel, sink->channel);
 }
 
 bool PipeWireContext::linkChannels(const VirtualChannel* source, const VirtualChannel* sink) const {
@@ -355,7 +335,7 @@ bool PipeWireContext::linkChannels(const VirtualChannel* source, const VirtualCh
 }
 
 StreamContext* PipeWireContext::findStreamContext(uint32_t nodeId) const {
-    for (VirtualChannel* channel : virtualChannels) {
+    for (const VirtualChannel* channel : virtualChannels) {
         if (channel == nullptr)
             continue;
 
@@ -373,4 +353,8 @@ StreamContext* PipeWireContext::findStreamContext(uint32_t nodeId) const {
     }
 
     return nullptr;
+}
+
+std::vector<VirtualChannel*> PipeWireContext::getChannels() const {
+    return virtualChannels;
 }
