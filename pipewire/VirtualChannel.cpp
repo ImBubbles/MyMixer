@@ -173,7 +173,7 @@ VirtualChannel::~VirtualChannel() {
     Log::info("Destroyed virtual channel \"" + name + "\"");
 }
 
-bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) {
+bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) const {
     if (from->context->core != to->context->core) {
         Log::error("Cannot link channels \"" + from->name + "\" and \"" + to->name + "\": different PipeWire cores");
         return false;

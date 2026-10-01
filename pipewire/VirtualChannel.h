@@ -35,7 +35,7 @@ struct VirtualChannel {
 
     const StreamContext* getSource() const;
     const StreamContext* getSink() const;
-    bool connect(VirtualChannel* from, const VirtualChannel* to);
+    bool connect(VirtualChannel* from, const VirtualChannel* to) const;
     std::vector<struct pw_link*> outputLinks;
 private:
     StreamContext* source;
