@@ -1,5 +1,6 @@
 #include "logger/Log.h"
 #include "Application.h"
+#include "environment/Environment.h"
 
 int main(const int argc, char *argv[]) {
     Log::LOG_FILTER = LogLevel::DEBUG;

@@ -13,34 +13,37 @@ FetchContent_MakeAvailable(nlohmann_json)
 
 set(CMAKE_CXX_STANDARD 26)
 
-# SHOULD BUILD HEADERS
+# Generate headers embedding the default JSON resources.
 option(MY_MIXER_BUILD_HEADERS "Build headers from template files" ON)
 
 if(MY_MIXER_BUILD_HEADERS)
-    # INPUTS
-    set(SETTINGS_JSON ${CMAKE_SOURCE_DIR}/environment/defaults/settings.json)
-    set(CONFIG_JSON ${CMAKE_SOURCE_DIR}/environment/defaults/config.json)
+    find_program(XXD_EXECUTABLE xxd REQUIRED)
 
-    # OUTPUTS
-    set(SETTINGS_HEADER environment/defaults/settings.h)
-    set(CONFIG_HEADER environment/defaults/config.json)
+    set(DEFAULTS_JSON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/environment/defaults")
+        set(DEFAULTS_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/environment/generated/defaults")
+    set(SETTINGS_JSON "${DEFAULTS_JSON_DIR}/settings.json")
+    set(CONFIG_JSON "${DEFAULTS_JSON_DIR}/config.json")
+    set(SETTINGS_HEADER "${DEFAULTS_GENERATED_DIR}/settings.h")
+    set(CONFIG_HEADER "${DEFAULTS_GENERATED_DIR}/config.h")
 
-    # GENERATE CONFIG JSON
     add_custom_command(
             OUTPUT ${SETTINGS_HEADER}
-            COMMAND xxd -i -n resource_default_settings ${SETTINGS_JSON} > ${SETTINGS_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${DEFAULTS_GENERATED_DIR}"
+            COMMAND ${XXD_EXECUTABLE} -i -n resource_default_settings "${SETTINGS_JSON}" "${SETTINGS_HEADER}"
             DEPENDS ${SETTINGS_JSON}
+            VERBATIM
     )
 
-    # GENERATE EXAMPLE HTML
     add_custom_command(
             OUTPUT ${CONFIG_HEADER}
-            COMMAND xxd -i -n resource_default_config ${CONFIG_JSON} > ${CONFIG_HEADER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${DEFAULTS_GENERATED_DIR}"
+            COMMAND ${XXD_EXECUTABLE} -i -n resource_default_config "${CONFIG_JSON}" "${CONFIG_HEADER}"
             DEPENDS ${CONFIG_JSON}
+            VERBATIM
     )
-endif()
 
-add_custom_target(generate_default_headers DEPENDS ${SETTINGS_HEADER} ${CONFIG_HEADER})
+    add_custom_target(generate_default_headers DEPENDS ${SETTINGS_HEADER} ${CONFIG_HEADER})
+endif()
 
 add_executable(MyMixer
         main.cpp
@@ -51,10 +54,14 @@ add_executable(MyMixer
         util/UtilString.cpp
         config/Config.cpp
         environment/Environment.cpp
-        ${CONFIG_HEADER}
-        ${EXAMPLE_HEADER}
         #util/UtilNumber.cpp
 )
+
+if(MY_MIXER_BUILD_HEADERS)
+        target_sources(MyMixer PRIVATE ${SETTINGS_HEADER} ${CONFIG_HEADER})
+        target_include_directories(MyMixer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_dependencies(MyMixer generate_default_headers)
+endif()
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PIPEWIRE REQUIRED libpipewire-0.3)

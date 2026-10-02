@@ -10,8 +10,16 @@
 
 #include "../logger/Log.h"
 
-static bool isEnvironmentSetup = false;
+struct Settings {
+    std::string config;
+    int logFilter;
+};
 
-void setupFileEnvironment();
-std::string readFile(std::string& filePath);
-struct HTTPServerConfig* loadServerConfig();
+namespace Environment {
+    static bool isEnvironmentSetup = false;
+    extern Settings settings;
+    static const char* userConfigDir = std::getenv("XDG_CONFIG_HOME");
+
+    void setupFileEnvironment();
+    std::string readFile(const std::string& filePath);
+};
