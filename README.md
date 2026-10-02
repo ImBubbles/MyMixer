@@ -8,9 +8,12 @@ I've wanted to use VoiceMeeter on Linux for awhile now but there's not support f
 * Creating and connecting VirtualChannels
 * Some other PipeWire API wrapping
 
+## In progress
+* Setup configuration support
+* Setup autostart / autoload
+
 ## Roadmap
 
 * Setup configuration support
-* Setup autostart / autoload
 * Add UI
 * Officially release
