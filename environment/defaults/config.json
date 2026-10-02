@@ -1,1 +1,14 @@
-{}
+{
+  "channels": [
+    {
+      "description": "Spotify",
+      "name": "spotify"
+    },
+    {
+      "description": "Discord",
+      "name": "discord"
+    }
+  ],
+  "connections": [],
+  "hardwareConnections": []
+}

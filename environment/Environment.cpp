@@ -163,27 +163,7 @@ namespace Environment {
         const int settingsCreate = ensureExistence(settingsPath.string(), defaultSettings);
         const int configCreate = ensureExistence(configPath.string(), defaultConfig);
 
-        if (settingsCreate == 0) {
-            try {
-                std::ifstream settingsInput(settingsPath);
-                nlohmann::json settings = nlohmann::json::parse(settingsInput);
-                if (!settings.is_object()) {
-                    throw std::runtime_error("Settings JSON root must be an object");
-                }
-
-                settings["defaultConfig"] = configPath.string();
-                std::ofstream settingsOutput(settingsPath, std::ios::trunc);
-                if (!settingsOutput.is_open()) {
-                    throw std::runtime_error("Could not open settings file for update");
-                }
-                settingsOutput << settings.dump(2) << '\n';
-                if (!settingsOutput) {
-                    throw std::runtime_error("Failed to write updated settings file");
-                }
-            } catch (const std::exception& error) {
-                Log::error("Failed to set default config path in settings: " + std::string(error.what()));
-            }
-        } else if (settingsCreate < 0) {
+        if (settingsCreate < 0) {
             Log::error("Failed to create settings file: " + settingsPath.string());
         }
 
@@ -197,10 +177,41 @@ namespace Environment {
                 throw std::runtime_error("Could not open settings file for loading");
             }
 
-            const nlohmann::json settingsJson = nlohmann::json::parse(settingsInput);
+            nlohmann::json settingsJson = nlohmann::json::parse(settingsInput);
+            if (!settingsJson.is_object()) {
+                throw std::runtime_error("Settings JSON root must be an object");
+            }
+
+            std::string configValue;
+            if (settingsJson.contains("config") && settingsJson["config"].is_string()) {
+                configValue = settingsJson["config"].get<std::string>();
+            }
+            if (configValue.empty() || configValue == "changeme") {
+                if (settingsJson.contains("defaultConfig") && settingsJson["defaultConfig"].is_string()) {
+                    configValue = settingsJson["defaultConfig"].get<std::string>();
+                }
+                if (configValue.empty() || configValue == "changeme") {
+                    configValue = configPath.string();
+                }
+                settingsJson["config"] = configValue;
+
+                std::ofstream settingsOutput(settingsPath, std::ios::trunc);
+                if (!settingsOutput.is_open()) {
+                    throw std::runtime_error("Could not open settings file for migration");
+                }
+                settingsOutput << settingsJson.dump(2) << '\n';
+                if (!settingsOutput) {
+                    throw std::runtime_error("Failed to write migrated settings file");
+                }
+            }
+
+            std::filesystem::path resolvedConfigPath(configValue);
+            if (resolvedConfigPath.is_relative()) {
+                resolvedConfigPath = configDir / resolvedConfigPath;
+            }
             Settings loadedSettings{
-                .config = settingsJson.at("config").get<std::string>(),
-                .logFilter = settingsJson.at("logFilter").get<int>(),
+                .config = resolvedConfigPath.lexically_normal().string(),
+                .logFilter = settingsJson.value("logFilter", 0),
             };
             settings = std::move(loadedSettings);
         } catch (const std::exception& error) {

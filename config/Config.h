@@ -13,6 +13,7 @@ struct ChannelConnectionConfig;
 struct Config {
     std::vector<VirtualChannelConfig> channels; // Config channels, not hot
     std::vector<ChannelConnectionConfig> connections;
+    std::vector<AudioConnection> hardwareConnections;
 };
 
 struct VirtualChannelConfig {

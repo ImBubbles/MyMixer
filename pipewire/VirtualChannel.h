@@ -1,7 +1,9 @@
 #pragma once
+#include <atomic>
 #include <array>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
@@ -15,10 +17,18 @@ struct StreamContext {
     StreamContext(VirtualChannel* channel, pw_stream* stream, const pw_direction direction, const bool process);
     VirtualChannel* channel;
     struct pw_stream* stream;
+    pw_direction direction;
 
     uint32_t nodeId = PW_ID_ANY;
     uint32_t leftPort = PW_ID_ANY;
     uint32_t rightPort = PW_ID_ANY;
+    std::string leftPortName;
+    std::string rightPortName;
+    std::atomic<uint32_t> negotiatedFormat{SPA_AUDIO_FORMAT_UNKNOWN};
+    std::atomic<uint32_t> negotiatedChannels{0};
+    std::atomic<uint32_t> leftChannel{0};
+    std::atomic<uint32_t> rightChannel{1};
+    std::atomic<bool> hasNegotiatedFormat{false};
 
     struct spa_hook listener;
     struct pw_stream_events events;
@@ -40,12 +50,17 @@ struct VirtualChannel {
 
     const StreamContext* getSource() const;
     const StreamContext* getSink() const;
+    std::pair<float, float> consumeInputPeaks() noexcept;
+    void updateInputPeaks(float left, float right) noexcept;
     bool connect(VirtualChannel* from, const VirtualChannel* to) const;
     void clearConnections();
+    bool clearConnectionsTo(const std::string& destinationName);
     std::vector<std::unique_ptr<OutputLink>> outputLinks;
 private:
     StreamContext* source;
     StreamContext* sink;
+    std::atomic<float> leftInputPeak{0.0f};
+    std::atomic<float> rightInputPeak{0.0f};
 };
 
 struct OutputLink {

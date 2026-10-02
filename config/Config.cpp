@@ -7,6 +7,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -45,6 +46,22 @@ bool isValidConfig(const Config& config) {
         }
     }
 
+    std::set<std::tuple<bool, std::string, bool, std::string>> hardwareConnections;
+    for (const AudioConnection& connection : config.hardwareConnections) {
+        if (connection.source.name.empty() || connection.destination.name.empty() ||
+            (connection.source.isHardware == false && connection.destination.isHardware == false) ||
+            (!connection.source.isHardware && channelNames.find(connection.source.name) == channelNames.end()) ||
+            (!connection.destination.isHardware && channelNames.find(connection.destination.name) == channelNames.end())) {
+            Log::error("Config contains an invalid hardware route endpoint");
+            return false;
+        }
+        if (!hardwareConnections.emplace(connection.source.isHardware, connection.source.name,
+                                         connection.destination.isHardware, connection.destination.name).second) {
+            Log::error("Config contains a duplicate hardware connection");
+            return false;
+        }
+    }
+
     return true;
 }
 }
@@ -57,6 +74,7 @@ Config ConfigHandler::toConfig(PipeWireContext* pwc) {
     const std::vector<VirtualChannel*> channels = pwc->getChannels();
     std::vector<VirtualChannelConfig> configChannels;
     std::vector<ChannelConnectionConfig> configConnections;
+    std::vector<AudioConnection> configHardwareConnections = pwc->getHardwareConnections();
     for (VirtualChannel* vc : channels) {
         if (vc == nullptr) {
             continue;
@@ -75,7 +93,8 @@ Config ConfigHandler::toConfig(PipeWireContext* pwc) {
 
     return {
         .channels = configChannels,
-        .connections = configConnections
+        .connections = configConnections,
+        .hardwareConnections = configHardwareConnections,
     };
 }
 
@@ -83,6 +102,7 @@ std::string ConfigHandler::toJson(const Config& config) {
     nlohmann::json json;
     json["channels"] = nlohmann::json::array();
     json["connections"] = nlohmann::json::array();
+    json["hardwareConnections"] = nlohmann::json::array();
 
     for (const VirtualChannelConfig& channel : config.channels) {
         json["channels"].push_back({
@@ -95,6 +115,13 @@ std::string ConfigHandler::toJson(const Config& config) {
         json["connections"].push_back({
             {"from", connection.from},
             {"to", connection.to},
+        });
+    }
+
+    for (const AudioConnection& connection : config.hardwareConnections) {
+        json["hardwareConnections"].push_back({
+            {"from", {{"name", connection.source.name}, {"hardware", connection.source.isHardware}}},
+            {"to", {{"name", connection.destination.name}, {"hardware", connection.destination.isHardware}}},
         });
     }
 
@@ -147,9 +174,19 @@ Config ConfigHandler::fromJson(const std::string& jsonText) {
         return value.get_ref<const std::string&>();
     };
 
-    requireObjectKeys(json, {"channels", "connections"}, "Config root");
+    if (!json.is_object() || !json.contains("channels") || !json.contains("connections")) {
+        throw std::invalid_argument("Config root must contain channels and connections");
+    }
+    for (auto field = json.begin(); field != json.end(); ++field) {
+        if (field.key() != "channels" && field.key() != "connections" && field.key() != "hardwareConnections") {
+            throw std::invalid_argument("Config root contains an unknown field: " + field.key());
+        }
+    }
     if (!json["channels"].is_array() || !json["connections"].is_array()) {
         throw std::invalid_argument("Config channels and connections must be arrays");
+    }
+    if (json.contains("hardwareConnections") && !json["hardwareConnections"].is_array()) {
+        throw std::invalid_argument("Config hardwareConnections must be an array");
     }
 
     std::vector<VirtualChannelConfig> channels;
@@ -174,9 +211,33 @@ Config ConfigHandler::fromJson(const std::string& jsonText) {
         });
     }
 
+    std::vector<AudioConnection> hardwareConnections;
+    if (json.contains("hardwareConnections")) {
+        const auto parseEndpoint = [&requireObjectKeys, &requireString](const Json& endpoint, const std::string& path) {
+            requireObjectKeys(endpoint, {"name", "hardware"}, path);
+            if (!endpoint["hardware"].is_boolean()) {
+                throw std::invalid_argument(path + ".hardware must be a boolean");
+            }
+            return AudioEndpoint{
+                .name = requireString(endpoint["name"], path + ".name"),
+                .isHardware = endpoint["hardware"].get<bool>(),
+            };
+        };
+        for (std::size_t index = 0; index < json["hardwareConnections"].size(); ++index) {
+            const Json& connection = json["hardwareConnections"][index];
+            const std::string path = "hardwareConnections[" + std::to_string(index) + "]";
+            requireObjectKeys(connection, {"from", "to"}, path);
+            hardwareConnections.push_back({
+                .source = parseEndpoint(connection["from"], path + ".from"),
+                .destination = parseEndpoint(connection["to"], path + ".to"),
+            });
+        }
+    }
+
     Config config{
         .channels = std::move(channels),
         .connections = std::move(connections),
+        .hardwareConnections = std::move(hardwareConnections),
     };
     if (!isValidConfig(config)) {
         throw std::invalid_argument("Config JSON contains invalid channel or connection data");
@@ -194,6 +255,10 @@ VirtualChannelConfig ConfigHandler::toVirtualChannelConfig(VirtualChannel* vc) {
 bool ConfigHandler::applyConfig(PipeWireContext* pwc, const Config& config) {
     if (pwc == nullptr || !isValidConfig(config)) {
         return false;
+    }
+
+    for (const AudioConnection& connection : pwc->getHardwareConnections()) {
+        pwc->setAudioConnection(connection.source, connection.destination, false);
     }
 
     std::map<std::string, const VirtualChannelConfig*> desiredChannels;
@@ -247,6 +312,13 @@ bool ConfigHandler::applyConfig(PipeWireContext* pwc, const Config& config) {
         if (from == channelsByName.end() || to == channelsByName.end() ||
             !pwc->linkChannels(from->second, to->second)) {
             Log::error("Failed to create configured connection \"" + connection.from + "\" -> \"" + connection.to + "\"");
+            return false;
+        }
+    }
+
+    for (const AudioConnection& connection : config.hardwareConnections) {
+        if (!pwc->setAudioConnection(connection.source, connection.destination, true)) {
+            Log::error("Failed to create configured hardware connection");
             return false;
         }
     }

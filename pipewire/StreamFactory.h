@@ -14,6 +14,7 @@ namespace StreamFactory {
             PW_KEY_NODE_NAME, nodeName.c_str(),
             PW_KEY_NODE_DESCRIPTION, (description + " Input").c_str(),
             PW_KEY_MEDIA_TYPE, "Audio",
+            PW_KEY_MEDIA_CLASS, "Audio/Sink",
             PW_KEY_MEDIA_CATEGORY, "Playback",
             PW_KEY_NODE_VIRTUAL, "true",
             nullptr
@@ -28,6 +29,7 @@ namespace StreamFactory {
             PW_KEY_NODE_NAME, nodeName.c_str(),
             PW_KEY_NODE_DESCRIPTION, (description + " Output").c_str(),
             PW_KEY_MEDIA_TYPE, "Audio",
+            PW_KEY_MEDIA_CLASS, "Audio/Source",
             PW_KEY_MEDIA_CATEGORY, "Capture",
             PW_KEY_NODE_VIRTUAL, "true",
             nullptr

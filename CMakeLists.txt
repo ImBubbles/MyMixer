@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.31)
 
 project(MyMixer CXX)
 
+# Qt6
+find_package(Qt6 REQUIRED COMPONENTS Widgets Concurrent)
+
 # JSON LIBRARY
 include(FetchContent)
 FetchContent_Declare(
@@ -54,6 +57,8 @@ add_executable(MyMixer
         util/UtilString.cpp
         config/Config.cpp
         environment/Environment.cpp
+        ui/FlowLayout.cpp
+        ui/MainWindow.cpp
         #util/UtilNumber.cpp
 )
 
@@ -75,6 +80,8 @@ target_link_directories(MyMixer PRIVATE
 )
 
 target_link_libraries(MyMixer PRIVATE
+        Qt6::Widgets
+        Qt6::Concurrent
         nlohmann_json::nlohmann_json
         ${PIPEWIRE_LIBRARIES}
 )

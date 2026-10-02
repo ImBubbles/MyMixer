@@ -1,9 +1,17 @@
 #pragma once
+
 #include "pipewire/PipeWireContext.h"
+
+class QApplication;
 
 class Application {
 public:
-    Application(int argc, char *argv[]);
+    Application();
+    ~Application();
+
+    int runGui(QApplication& application);
+    int runHeadless();
+
 private:
-    PipeWireContext pipewireContext;
+    PipeWireContext pipeWireContext;
 };

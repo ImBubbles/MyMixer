@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <thread>
 #include <utility>
@@ -10,56 +11,125 @@
 
 static void stream_process(void *data)
 {
-    auto *channel = static_cast<VirtualChannel *>(data);
+    auto *streamContext = static_cast<StreamContext *>(data);
+    auto *channel = streamContext->channel;
 
-    pw_buffer *inBuffer = pw_stream_dequeue_buffer(channel->getSource()->stream);
+    pw_buffer *inBuffer = pw_stream_dequeue_buffer(streamContext->stream);
 
     if (inBuffer == nullptr) {
         return;
     }
 
-    pw_buffer *outBuffer = pw_stream_dequeue_buffer(channel->getSink()->stream);
+    float leftPeak = 0.0f;
+    float rightPeak = 0.0f;
+    const uint32_t format = streamContext->negotiatedFormat.load(std::memory_order_relaxed);
+    const uint32_t channelCount = streamContext->negotiatedChannels.load(std::memory_order_relaxed);
+    const uint32_t leftChannel = streamContext->leftChannel.load(std::memory_order_relaxed);
+    const uint32_t rightChannel = streamContext->rightChannel.load(std::memory_order_relaxed);
+    const bool planar = format == SPA_AUDIO_FORMAT_F32P;
+    const bool interleaved = format == SPA_AUDIO_FORMAT_F32;
+    const auto validRange = [](const spa_data& audioData) {
+        return audioData.data != nullptr && audioData.chunk != nullptr &&
+               (audioData.chunk->flags & SPA_CHUNK_FLAG_CORRUPTED) == 0 &&
+               audioData.chunk->offset <= audioData.maxsize &&
+               audioData.chunk->size <= audioData.maxsize - audioData.chunk->offset;
+    };
+    if (streamContext->hasNegotiatedFormat.load(std::memory_order_relaxed) && channelCount >= 2 &&
+        leftChannel < channelCount && rightChannel < channelCount && inBuffer->buffer != nullptr) {
+        const auto samplePeak = [](float sample, float& peak) {
+            const float magnitude = std::fabs(sample);
+            if (std::isfinite(magnitude)) {
+                peak = std::max(peak, magnitude);
+            }
+        };
+        if (interleaved && inBuffer->buffer->n_datas >= 1) {
+            const spa_data& audioData = inBuffer->buffer->datas[0];
+            const uint32_t frameStride = audioData.chunk != nullptr && audioData.chunk->stride > 0
+                ? static_cast<uint32_t>(audioData.chunk->stride)
+                : channelCount * sizeof(float);
+            if (validRange(audioData) && frameStride >= channelCount * sizeof(float)) {
+                const uint32_t frameCount = audioData.chunk->size / frameStride;
+                const auto* bytes = static_cast<const uint8_t*>(audioData.data) + audioData.chunk->offset;
+                for (uint32_t frame = 0; frame < frameCount; ++frame) {
+                    float leftSample = 0.0f;
+                    float rightSample = 0.0f;
+                    std::memcpy(&leftSample, bytes + frame * frameStride + leftChannel * sizeof(float), sizeof(float));
+                    std::memcpy(&rightSample, bytes + frame * frameStride + rightChannel * sizeof(float), sizeof(float));
+                    samplePeak(leftSample, leftPeak);
+                    samplePeak(rightSample, rightPeak);
+                }
+            }
+        } else if (planar && inBuffer->buffer->n_datas >= channelCount) {
+            for (const auto [audioChannel, peak] : {std::pair{leftChannel, &leftPeak}, std::pair{rightChannel, &rightPeak}}) {
+                const spa_data& audioData = inBuffer->buffer->datas[audioChannel];
+                const uint32_t sampleStride = audioData.chunk != nullptr && audioData.chunk->stride > 0
+                    ? static_cast<uint32_t>(audioData.chunk->stride)
+                    : sizeof(float);
+                if (!validRange(audioData) || sampleStride < sizeof(float)) {
+                    continue;
+                }
+                const uint32_t frameCount = audioData.chunk->size / sampleStride;
+                const auto* bytes = static_cast<const uint8_t*>(audioData.data) + audioData.chunk->offset;
+                for (uint32_t frame = 0; frame < frameCount; ++frame) {
+                    float sample = 0.0f;
+                    std::memcpy(&sample, bytes + frame * sampleStride, sizeof(float));
+                    samplePeak(sample, *peak);
+                }
+            }
+        }
+    }
+    channel->updateInputPeaks(leftPeak, rightPeak);
+
+    const StreamContext* outputContext = channel->getSink();
+    pw_buffer *outBuffer = pw_stream_dequeue_buffer(outputContext->stream);
 
     if (outBuffer == nullptr) {
-        pw_stream_queue_buffer(channel->getSource()->stream, inBuffer);
+        pw_stream_queue_buffer(streamContext->stream, inBuffer);
         return;
     }
 
+    const bool sameFormat = streamContext->hasNegotiatedFormat.load(std::memory_order_relaxed) &&
+        outputContext->hasNegotiatedFormat.load(std::memory_order_relaxed) &&
+        streamContext->negotiatedFormat.load(std::memory_order_relaxed) == outputContext->negotiatedFormat.load(std::memory_order_relaxed) &&
+        streamContext->negotiatedChannels.load(std::memory_order_relaxed) == outputContext->negotiatedChannels.load(std::memory_order_relaxed);
+    const bool isPlanar = format == SPA_AUDIO_FORMAT_F32P;
+    const uint32_t dataCount = isPlanar ? channelCount : 1;
+    bool canCopy = sameFormat && inBuffer->buffer != nullptr && outBuffer->buffer != nullptr &&
+                   (format == SPA_AUDIO_FORMAT_F32 || isPlanar) &&
+                   inBuffer->buffer->n_datas >= dataCount && outBuffer->buffer->n_datas >= dataCount;
+    if (canCopy) {
+        for (uint32_t index = 0; index < dataCount; ++index) {
+            const spa_data& sourceData = inBuffer->buffer->datas[index];
+            const spa_data& destinationData = outBuffer->buffer->datas[index];
+            if (!validRange(sourceData) || destinationData.data == nullptr || destinationData.chunk == nullptr ||
+                sourceData.chunk->size > destinationData.maxsize) {
+                canCopy = false;
+                break;
+            }
+        }
+    }
 
-    spa_data *inData = &inBuffer->buffer->datas[0];
+    if (canCopy) {
+        for (uint32_t index = 0; index < dataCount; ++index) {
+            const spa_data& sourceData = inBuffer->buffer->datas[index];
+            spa_data& destinationData = outBuffer->buffer->datas[index];
+            const auto* sourceBytes = static_cast<const uint8_t*>(sourceData.data) + sourceData.chunk->offset;
+            std::memcpy(destinationData.data, sourceBytes, sourceData.chunk->size);
+            destinationData.chunk->offset = 0;
+            destinationData.chunk->size = sourceData.chunk->size;
+            destinationData.chunk->stride = sourceData.chunk->stride;
+            destinationData.chunk->flags = sourceData.chunk->flags;
+        }
+    } else if (outBuffer->buffer != nullptr) {
+        for (uint32_t index = 0; index < outBuffer->buffer->n_datas; ++index) {
+            if (outBuffer->buffer->datas[index].chunk != nullptr) {
+                outBuffer->buffer->datas[index].chunk->size = 0;
+            }
+        }
+    }
 
-    spa_data *outData = &outBuffer->buffer->datas[0];
-
-
-    // assuming float audio
-    float *input = static_cast<float *>(inData->data);
-
-    float *output = static_cast<float *>(outData->data);
-
-
-    uint32_t samples = inData->chunk->size / sizeof(float);
-
-
-    memcpy(
-        output,
-        input,
-        samples * sizeof(float)
-    );
-
-
-    outData->chunk->size =
-        inData->chunk->size;
-
-
-    pw_stream_queue_buffer(
-        channel->getSource()->stream,
-        inBuffer
-    );
-
-    pw_stream_queue_buffer(
-        channel->getSink()->stream,
-        outBuffer
-    );
+    pw_stream_queue_buffer(streamContext->stream, inBuffer);
+    pw_stream_queue_buffer(outputContext->stream, outBuffer);
 }
 
 static void stream_state_changed(
@@ -68,7 +138,8 @@ static void stream_state_changed(
     enum pw_stream_state state,
     const char *error)
 {
-    auto *channel = static_cast<VirtualChannel *>(data);
+    auto *streamContext = static_cast<StreamContext *>(data);
+    auto *channel = streamContext->channel;
 
     if (error != nullptr) {
         Log::error("Stream error: " + std::string(error));
@@ -82,12 +153,59 @@ static void stream_state_changed(
     pw_thread_loop_signal(channel->context->loop, false);
 }
 
+static void stream_param_changed(void* data, const uint32_t id, const spa_pod* parameter)
+{
+    auto* streamContext = static_cast<StreamContext*>(data);
+    if (id != SPA_PARAM_Format || parameter == nullptr) {
+        return;
+    }
+
+    spa_audio_info_raw format{};
+    if (spa_format_audio_raw_parse(parameter, &format) < 0) {
+        streamContext->hasNegotiatedFormat.store(false, std::memory_order_relaxed);
+        Log::warning("Stream negotiated a non-raw audio format");
+        return;
+    }
+
+    uint32_t leftChannel = 0;
+    uint32_t rightChannel = 1;
+    if (!SPA_FLAG_IS_SET(format.flags, SPA_AUDIO_FLAG_UNPOSITIONED)) {
+        bool foundLeft = false;
+        bool foundRight = false;
+        for (uint32_t index = 0; index < format.channels; ++index) {
+            if (format.position[index] == SPA_AUDIO_CHANNEL_FL) {
+                leftChannel = index;
+                foundLeft = true;
+            } else if (format.position[index] == SPA_AUDIO_CHANNEL_FR) {
+                rightChannel = index;
+                foundRight = true;
+            }
+        }
+        if (!foundLeft || !foundRight) {
+            streamContext->hasNegotiatedFormat.store(false, std::memory_order_relaxed);
+            Log::warning("Stream format does not provide front-left and front-right channels");
+            return;
+        }
+    }
+
+    streamContext->negotiatedFormat.store(format.format, std::memory_order_relaxed);
+    streamContext->negotiatedChannels.store(format.channels, std::memory_order_relaxed);
+    streamContext->leftChannel.store(leftChannel, std::memory_order_relaxed);
+    streamContext->rightChannel.store(rightChannel, std::memory_order_relaxed);
+    const bool supportedFormat = format.channels >= 2 &&
+        (format.format == SPA_AUDIO_FORMAT_F32 || format.format == SPA_AUDIO_FORMAT_F32P);
+    streamContext->hasNegotiatedFormat.store(supportedFormat, std::memory_order_relaxed);
+    Log::info("Stream negotiated audio format " + std::to_string(format.format) + " with " +
+              std::to_string(format.channels) + " channels; meter " + (supportedFormat ? "enabled" : "unsupported"));
+}
+
 StreamContext::StreamContext(VirtualChannel* channel, pw_stream* stream, const pw_direction direction, const bool process)
     :
-    channel(channel), stream(stream) {
+    channel(channel), stream(stream), direction(direction) {
     events = {
         .version = PW_VERSION_STREAM_EVENTS,
         .state_changed = stream_state_changed,
+        .param_changed = stream_param_changed,
     };
     if (process) {
         events.process = stream_process;
@@ -98,7 +216,7 @@ StreamContext::StreamContext(VirtualChannel* channel, pw_stream* stream, const p
         stream,
         &listener,
         &events,
-        channel
+        this
         );
     // Parameters
     uint8_t buffer[1024];
@@ -184,6 +302,44 @@ void VirtualChannel::clearConnections() {
     outputLinks.clear();
 }
 
+bool VirtualChannel::clearConnectionsTo(const std::string& destinationName) {
+    bool removed = false;
+    pw_thread_loop_lock(context->loop);
+    auto link = outputLinks.begin();
+    while (link != outputLinks.end()) {
+        if (*link == nullptr || (*link)->to != destinationName) {
+            ++link;
+            continue;
+        }
+
+        for (pw_link* pipeWireLink : (*link)->links) {
+            if (pipeWireLink != nullptr) {
+                pw_core_destroy(context->core, pipeWireLink);
+            }
+        }
+        removed = true;
+        link = outputLinks.erase(link);
+    }
+    pw_thread_loop_unlock(context->loop);
+    return removed;
+}
+
+std::pair<float, float> VirtualChannel::consumeInputPeaks() noexcept {
+    return {
+        leftInputPeak.exchange(0.0f, std::memory_order_relaxed),
+        rightInputPeak.exchange(0.0f, std::memory_order_relaxed),
+    };
+}
+
+void VirtualChannel::updateInputPeaks(const float left, const float right) noexcept {
+    float previousLeft = leftInputPeak.load(std::memory_order_relaxed);
+    while (left > previousLeft && !leftInputPeak.compare_exchange_weak(previousLeft, left, std::memory_order_relaxed)) {
+    }
+    float previousRight = rightInputPeak.load(std::memory_order_relaxed);
+    while (right > previousRight && !rightInputPeak.compare_exchange_weak(previousRight, right, std::memory_order_relaxed)) {
+    }
+}
+
 bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) const {
     if (from->context->core != to->context->core) {
         Log::error("Cannot link channels \"" + from->name + "\" and \"" + to->name + "\": different PipeWire cores");
@@ -212,60 +368,32 @@ bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) con
     const uint32_t outputNodeId = pw_stream_get_node_id(fromSink->stream);
     const uint32_t inputNodeId = pw_stream_get_node_id(toSource->stream);
 
-    const char* portNames[2][2] = {
-        { "output_FL", "input_FL" },
-        { "output_FR", "input_FR" }
+    const std::string* sourcePortNames[2] = {
+        &fromSink->leftPortName,
+        &fromSink->rightPortName
     };
+    const std::string* destinationPortNames[2] = {
+        &toSource->leftPortName,
+        &toSource->rightPortName
+    };
+    if (sourcePortNames[0]->empty() || sourcePortNames[1]->empty() ||
+        destinationPortNames[0]->empty() || destinationPortNames[1]->empty()) {
+        Log::error("Cannot link channels \"" + from->name + "\" and \"" + to->name + "\": port names are not available");
+        return false;
+    }
     from->outputLinks.reserve(from->outputLinks.size() + 1);
     auto outputLink = std::make_unique<OutputLink>();
     outputLink->from = from->name;
     outputLink->to = to->name;
-
-    for (int channel = 0; channel < 2; ++channel) {
-        pw_properties* props = pw_properties_new(
-            PW_KEY_LINK_OUTPUT_NODE, std::to_string(outputNodeId).c_str(),
-            PW_KEY_LINK_INPUT_NODE, std::to_string(inputNodeId).c_str(),
-            PW_KEY_LINK_OUTPUT_PORT, portNames[channel][0],
-            PW_KEY_LINK_INPUT_PORT, portNames[channel][1],
-            nullptr
-        );
-
-        if (props == nullptr) {
-            Log::error("Failed to create link properties for stereo channel " + std::to_string(channel) + " between \"" + from->name + "\" and \"" + to->name + "\"");
-            break;
-        }
-
-        pw_thread_loop_lock(from->context->loop);
-        outputLink->links[channel] = static_cast<pw_link*>(pw_core_create_object(
-            from->context->core,
-            "link-factory",
-            PW_TYPE_INTERFACE_Link,
-            PW_VERSION_LINK,
-            &props->dict,
-            0
-        ));
-        pw_thread_loop_unlock(from->context->loop);
-        pw_properties_free(props);
-
-        if (outputLink->links[channel] == nullptr) {
-            Log::error("Failed to create PipeWire link for stereo channel " + std::to_string(channel) + " from \"" + from->name + "\" to \"" + to->name + "\"");
-            break;
-        }
-    }
-
-    if (outputLink->links[0] == nullptr || outputLink->links[1] == nullptr) {
-        pw_thread_loop_lock(from->context->loop);
-        for (pw_link* link : outputLink->links) {
-            if (link != nullptr) {
-                pw_core_destroy(from->context->core, link);
-            }
-        }
-        pw_thread_loop_unlock(from->context->loop);
+    const std::array<std::string, 2> outputPortNames{*sourcePortNames[0], *sourcePortNames[1]};
+    const std::array<std::string, 2> inputPortNames{*destinationPortNames[0], *destinationPortNames[1]};
+    if (!from->context->createStereoLinks(outputNodeId, outputPortNames, inputNodeId, inputPortNames, outputLink->links)) {
         return false;
     }
 
     from->outputLinks.push_back(std::move(outputLink));
-    Log::info("Linked channel \"" + from->name + "\" -> \"" + to->name + "\" via PipeWire stereo links");
+    Log::info("Linked channel \"" + from->name + "\" (" + outputPortNames[0] + ", " + outputPortNames[1] +
+              ") -> \"" + to->name + "\" (" + inputPortNames[0] + ", " + inputPortNames[1] + ")");
     return true;
 }
 
@@ -306,7 +434,11 @@ bool VirtualChannel::waitForPorts() const {
         (source->leftPort == PW_ID_ANY ||
          source->rightPort == PW_ID_ANY ||
          sink->leftPort == PW_ID_ANY ||
-         sink->rightPort == PW_ID_ANY) &&
+         sink->rightPort == PW_ID_ANY ||
+         source->leftPortName.empty() ||
+         source->rightPortName.empty() ||
+         sink->leftPortName.empty() ||
+         sink->rightPortName.empty()) &&
         std::chrono::steady_clock::now() < deadline
     ) {
         pw_thread_loop_wait(context->loop);
@@ -318,7 +450,11 @@ bool VirtualChannel::waitForPorts() const {
         source->leftPort != PW_ID_ANY &&
         source->rightPort != PW_ID_ANY &&
         sink->leftPort != PW_ID_ANY &&
-        sink->rightPort != PW_ID_ANY;
+        sink->rightPort != PW_ID_ANY &&
+        !source->leftPortName.empty() &&
+        !source->rightPortName.empty() &&
+        !sink->leftPortName.empty() &&
+        !sink->rightPortName.empty();
 
     if (!ready) {
         Log::error(
