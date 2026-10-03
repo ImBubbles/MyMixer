@@ -12,7 +12,7 @@ public:
 
     FLogger(const std::string& fileName) : file(fileName, std::ios::out) {} // will close upon deletion by default
     void nl() override {
-        file << std::endl;
+        file << '\n';
         prefixNext = true;
     }
     void log(const int level, const std::string& message, const bool nl) override {

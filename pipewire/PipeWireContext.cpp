@@ -113,7 +113,7 @@ static void registry_global(
                 stream->rightPortName = portName;
             }
         }
-        Log::debug("Set port " + std::to_string(id) + " for node " + std::to_string(nodeId) + " channel " + std::string(channel));
+        Log::logAsync(LogLevel::DEBUG, "Set port " + std::to_string(id) + " for node " + std::to_string(nodeId) + " channel " + std::string(channel));
         pw_thread_loop_signal(ctx->loop, false);
         return;
     }
@@ -125,10 +125,10 @@ static void registry_global(
         const char* inPortStr = spa_dict_lookup(props, "link.input.port");
 
         if (outNodeStr && outPortStr && inNodeStr && inPortStr) {
-            Log::info("Registry: link " + std::to_string(id) + " -> " + std::string(outNodeStr) + ":" + outPortStr +
+            Log::logAsync(LogLevel::INFO, "Registry: link " + std::to_string(id) + " -> " + std::string(outNodeStr) + ":" + outPortStr +
                       " -> " + inNodeStr + ":" + inPortStr);
         } else {
-            Log::debug("Registry: link object " + std::to_string(id) + " published (partial props)");
+            Log::logAsync(LogLevel::DEBUG, "Registry: link object " + std::to_string(id) + " published (partial props)");
         }
         return;
     }
@@ -558,7 +558,7 @@ void PipeWireContext::addHardwareNode(const uint32_t id, const spa_dict* props) 
         return candidate.name == device.name;
     });
     if (existing == hardwareDevices.end()) {
-        Log::info("Discovered hardware audio " + std::string(isInput ? "input: " : "output: ") + device.name);
+        Log::logAsync(LogLevel::INFO, "Discovered hardware audio " + std::string(isInput ? "input: " : "output: ") + device.name);
         hardwareDevices.push_back(std::move(device));
     } else {
         existing->description = std::move(device.description);

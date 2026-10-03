@@ -14,6 +14,20 @@ static void stream_process(void *data)
     auto *streamContext = static_cast<StreamContext *>(data);
     auto *channel = streamContext->channel;
 
+    // Diagnostics: flag gaps between process() calls far larger than any plausible quantum (stutter investigation).
+    const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const int64_t previous = streamContext->lastProcessTimeNs.exchange(now, std::memory_order_relaxed);
+    if (previous != 0) {
+        const int64_t gap = now - previous;
+        constexpr int64_t stutterThresholdNs = 30'000'000;
+        if (gap > stutterThresholdNs) {
+            streamContext->missedDeadlineCount.fetch_add(1, std::memory_order_relaxed);
+            int64_t currentMax = streamContext->maxGapNs.load(std::memory_order_relaxed);
+            while (gap > currentMax && !streamContext->maxGapNs.compare_exchange_weak(currentMax, gap, std::memory_order_relaxed)) {
+            }
+        }
+    }
+
     pw_buffer *inBuffer = pw_stream_dequeue_buffer(streamContext->stream);
 
     if (inBuffer == nullptr) {
@@ -91,7 +105,9 @@ static void stream_process(void *data)
     const bool sameFormat = streamContext->hasNegotiatedFormat.load(std::memory_order_relaxed) &&
         outputContext->hasNegotiatedFormat.load(std::memory_order_relaxed) &&
         streamContext->negotiatedFormat.load(std::memory_order_relaxed) == outputContext->negotiatedFormat.load(std::memory_order_relaxed) &&
-        streamContext->negotiatedChannels.load(std::memory_order_relaxed) == outputContext->negotiatedChannels.load(std::memory_order_relaxed);
+        streamContext->negotiatedChannels.load(std::memory_order_relaxed) == outputContext->negotiatedChannels.load(std::memory_order_relaxed) &&
+        // a rate mismatch here would corrupt audio if copied raw, since no resampling is performed
+        streamContext->negotiatedRate.load(std::memory_order_relaxed) == outputContext->negotiatedRate.load(std::memory_order_relaxed);
     const bool isPlanar = format == SPA_AUDIO_FORMAT_F32P;
     const uint32_t dataCount = isPlanar ? channelCount : 1;
     bool canCopy = sameFormat && inBuffer->buffer != nullptr && outBuffer->buffer != nullptr &&
@@ -141,10 +157,12 @@ static void stream_state_changed(
     auto *streamContext = static_cast<StreamContext *>(data);
     auto *channel = streamContext->channel;
 
+    // Logging here runs on the realtime PipeWire thread, so it must never block on I/O.
     if (error != nullptr) {
-        Log::error("Stream error: " + std::string(error));
+        Log::logAsync(LogLevel::ERROR, "Stream error: " + std::string(error));
     }
-    Log::debug(
+    Log::logAsync(
+        LogLevel::DEBUG,
         "Channel \"" + channel->name +
         "\" stream state: " +
         std::string(pw_stream_state_as_string(state))
@@ -163,7 +181,7 @@ static void stream_param_changed(void* data, const uint32_t id, const spa_pod* p
     spa_audio_info_raw format{};
     if (spa_format_audio_raw_parse(parameter, &format) < 0) {
         streamContext->hasNegotiatedFormat.store(false, std::memory_order_relaxed);
-        Log::warning("Stream negotiated a non-raw audio format");
+        Log::logAsync(LogLevel::WARNING, "Stream negotiated a non-raw audio format");
         return;
     }
 
@@ -183,20 +201,22 @@ static void stream_param_changed(void* data, const uint32_t id, const spa_pod* p
         }
         if (!foundLeft || !foundRight) {
             streamContext->hasNegotiatedFormat.store(false, std::memory_order_relaxed);
-            Log::warning("Stream format does not provide front-left and front-right channels");
+            Log::logAsync(LogLevel::WARNING, "Stream format does not provide front-left and front-right channels");
             return;
         }
     }
 
     streamContext->negotiatedFormat.store(format.format, std::memory_order_relaxed);
     streamContext->negotiatedChannels.store(format.channels, std::memory_order_relaxed);
+    streamContext->negotiatedRate.store(format.rate, std::memory_order_relaxed);
     streamContext->leftChannel.store(leftChannel, std::memory_order_relaxed);
     streamContext->rightChannel.store(rightChannel, std::memory_order_relaxed);
     const bool supportedFormat = format.channels >= 2 &&
         (format.format == SPA_AUDIO_FORMAT_F32 || format.format == SPA_AUDIO_FORMAT_F32P);
     streamContext->hasNegotiatedFormat.store(supportedFormat, std::memory_order_relaxed);
-    Log::info("Stream negotiated audio format " + std::to_string(format.format) + " with " +
-              std::to_string(format.channels) + " channels; meter " + (supportedFormat ? "enabled" : "unsupported"));
+    Log::logAsync(LogLevel::INFO, "Stream negotiated audio format " + std::to_string(format.format) + " with " +
+              std::to_string(format.channels) + " channels at " + std::to_string(format.rate) + "Hz; meter " +
+              (supportedFormat ? "enabled" : "unsupported"));
 }
 
 StreamContext::StreamContext(VirtualChannel* channel, pw_stream* stream, const pw_direction direction, const bool process)
@@ -338,6 +358,16 @@ void VirtualChannel::updateInputPeaks(const float left, const float right) noexc
     float previousRight = rightInputPeak.load(std::memory_order_relaxed);
     while (right > previousRight && !rightInputPeak.compare_exchange_weak(previousRight, right, std::memory_order_relaxed)) {
     }
+}
+
+VirtualChannel::ChannelDiagnostics VirtualChannel::consumeDiagnostics() noexcept {
+    ChannelDiagnostics diagnostics;
+    for (StreamContext* streamContext : {source, sink}) {
+        diagnostics.missedDeadlines += streamContext->missedDeadlineCount.exchange(0, std::memory_order_relaxed);
+        const int64_t gap = streamContext->maxGapNs.exchange(0, std::memory_order_relaxed);
+        diagnostics.maxGapNs = std::max(diagnostics.maxGapNs, gap);
+    }
+    return diagnostics;
 }
 
 bool VirtualChannel::connect(VirtualChannel* from, const VirtualChannel* to) const {

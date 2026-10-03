@@ -26,9 +26,15 @@ struct StreamContext {
     std::string rightPortName;
     std::atomic<uint32_t> negotiatedFormat{SPA_AUDIO_FORMAT_UNKNOWN};
     std::atomic<uint32_t> negotiatedChannels{0};
+    std::atomic<uint32_t> negotiatedRate{0};
     std::atomic<uint32_t> leftChannel{0};
     std::atomic<uint32_t> rightChannel{1};
     std::atomic<bool> hasNegotiatedFormat{false};
+
+    // Diagnostics for tracking down audio stutter; written from the PipeWire thread, read/reset from the UI thread.
+    std::atomic<int64_t> lastProcessTimeNs{0};
+    std::atomic<uint64_t> missedDeadlineCount{0};
+    std::atomic<int64_t> maxGapNs{0};
 
     struct spa_hook listener;
     struct pw_stream_events events;
@@ -56,6 +62,13 @@ struct VirtualChannel {
     void clearConnections();
     bool clearConnectionsTo(const std::string& destinationName);
     std::vector<std::unique_ptr<OutputLink>> outputLinks;
+
+    // Temporary diagnostics (see Phase 1 stutter investigation) to detect missed process() deadlines.
+    struct ChannelDiagnostics {
+        uint64_t missedDeadlines = 0;
+        int64_t maxGapNs = 0;
+    };
+    ChannelDiagnostics consumeDiagnostics() noexcept;
 private:
     StreamContext* source;
     StreamContext* sink;

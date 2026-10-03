@@ -32,4 +32,28 @@ void Log::defaultLogger() {
 	Log::setLogger(std::make_unique<CLogger>());
 }
 
+void Log::logAsync(const int level, const std::string& message) {
+	if (level < Log::LOG_FILTER) {
+		return;
+	}
+	std::unique_lock<std::mutex> lock(asyncMutex, std::try_to_lock);
+	if (!lock.owns_lock()) {
+		return; // dropped: never block the realtime caller
+	}
+	asyncQueue.push_back({level, message, true});
+}
+
+void Log::drainAsync() {
+	std::vector<PendingEntry> pending;
+	{
+		std::lock_guard<std::mutex> lock(asyncMutex);
+		pending.swap(asyncQueue);
+	}
+	for (const PendingEntry& entry : pending) {
+		Log::log(entry.level, entry.message, entry.newline);
+	}
+}
+
 std::unique_ptr<Logger> Log::logger = nullptr;
+std::mutex Log::asyncMutex;
+std::vector<Log::PendingEntry> Log::asyncQueue;

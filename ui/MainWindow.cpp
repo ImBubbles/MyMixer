@@ -43,6 +43,7 @@
 #include <utility>
 
 #include "../config/Config.h"
+#include "../logger/Log.h"
 #include "../pipewire/PipeWireContext.h"
 #include "../pipewire/VirtualChannel.h"
 #include "FlowLayout.h"
@@ -751,7 +752,16 @@ void MainWindow::addHardware() {
 }
 
 void MainWindow::updateMeters() {
+    Log::drainAsync(); // flush any log messages queued by the realtime PipeWire thread
     const std::vector<VirtualChannel*> channels = context_.getChannels();
+    for (const VirtualChannel* channel : channels) {
+        const auto diagnostics = const_cast<VirtualChannel*>(channel)->consumeDiagnostics();
+        if (diagnostics.missedDeadlines > 0) {
+            Log::warning("Channel \"" + channel->name + "\" missed " +
+                std::to_string(diagnostics.missedDeadlines) + " process deadline(s), max gap " +
+                std::to_string(diagnostics.maxGapNs / 1'000'000) + "ms");
+        }
+    }
     for (MeterDisplay& meter : meters_) {
         const auto channel = std::find_if(channels.begin(), channels.end(), [&meter](const VirtualChannel* candidate) {
             return candidate != nullptr && candidate->name == meter.channelName;

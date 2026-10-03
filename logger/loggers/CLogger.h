@@ -16,7 +16,7 @@ namespace ANSI {
 
 class CLogger : public Logger {
     void nl() override {
-        std::cout << ANSI::RESET << std::endl;
+        std::cout << ANSI::RESET << '\n';
         prefixNext = true;
     }
     void log(const int level, const std::string& message, const bool nl) override {
