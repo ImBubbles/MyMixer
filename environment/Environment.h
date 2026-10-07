@@ -22,4 +22,7 @@ namespace Environment {
 
     void setupFileEnvironment();
     std::string readFile(const std::string& filePath);
+    bool isAutostartEnabled();
+    bool setAutostart(bool enabled, const std::string& executablePath);
+    bool setDefaultConfigPath(const std::string& path);
 };

@@ -130,6 +130,66 @@ namespace Environment {
         return buffer.str();
     }
 
+    static std::filesystem::path autostartFilePath() {
+        const char* home = std::getenv("HOME");
+        std::filesystem::path base = userConfigDir ? std::filesystem::path(userConfigDir)
+            : std::filesystem::path(home ? home : "") / ".config";
+        return base / "autostart" / "mymixer.desktop";
+    }
+
+    bool isAutostartEnabled() {
+        std::error_code error;
+        return std::filesystem::exists(autostartFilePath(), error) && !error;
+    }
+
+    bool setAutostart(const bool enabled, const std::string& executablePath) {
+        const std::filesystem::path path = autostartFilePath();
+        std::error_code error;
+        if (!enabled) {
+            std::filesystem::remove(path, error);
+            return !error;
+        }
+        if (executablePath.empty() || ensureFilePathExistence(path.parent_path().string()) < 0) {
+            return false;
+        }
+        std::ofstream output(path, std::ios::trunc);
+        if (!output.is_open()) {
+            return false;
+        }
+        // Exec values with spaces must be double-quoted per the desktop entry spec.
+        output << "[Desktop Entry]\nType=Application\nName=MyMixer\nExec=\"" << executablePath << "\"\n";
+        return static_cast<bool>(output);
+    }
+
+    bool setDefaultConfigPath(const std::string& path) {
+        const char* home = std::getenv("HOME");
+        const std::filesystem::path configDir = (userConfigDir ? std::filesystem::path(userConfigDir)
+            : std::filesystem::path(home ? home : "") / ".config") / "MyMixer";
+        const std::filesystem::path settingsPath = configDir / "settings.json";
+        try {
+            nlohmann::json settingsJson;
+            {
+                std::ifstream input(settingsPath);
+                if (!input.is_open()) {
+                    return false;
+                }
+                settingsJson = nlohmann::json::parse(input);
+            }
+            const std::string absolute = std::filesystem::absolute(path).lexically_normal().string();
+            settingsJson["config"] = absolute;
+            std::ofstream output(settingsPath, std::ios::trunc);
+            output << settingsJson.dump(2) << '\n';
+            if (!output) {
+                return false;
+            }
+            settings.config = absolute;
+            return true;
+        } catch (const std::exception& error) {
+            Log::error("Failed to update default config: " + std::string(error.what()));
+            return false;
+        }
+    }
+
     void setupFileEnvironment() {
 
         Log::info("Setting up environment ...");

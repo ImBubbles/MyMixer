@@ -67,5 +67,6 @@ private:
     void addHardware();
     void importConfig();
     void exportConfig();
+    void setDefaultConfig();
     void runOperation(std::function<UiOperationResult()> operation, Completion completion = {});
 };

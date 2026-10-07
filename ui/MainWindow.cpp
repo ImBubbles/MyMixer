@@ -5,6 +5,7 @@
 #include <QBoxLayout>
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QCoreApplication>
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -43,6 +44,7 @@
 #include <utility>
 
 #include "../config/Config.h"
+#include "../environment/Environment.h"
 #include "../logger/Log.h"
 #include "../pipewire/PipeWireContext.h"
 #include "../pipewire/VirtualChannel.h"
@@ -208,6 +210,18 @@ MainWindow::MainWindow(PipeWireContext& context)
     toolbar_->addWidget(new QLabel("Config"));
     QAction* importAction = toolbar_->addAction("Import");
     QAction* exportAction = toolbar_->addAction("Export");
+    QAction* setDefaultAction = toolbar_->addAction("Set Default");
+    setDefaultAction->setToolTip("Choose the config file loaded at startup");
+    toolbar_->addSeparator();
+    QAction* autostartAction = toolbar_->addAction("");
+    autostartAction->setCheckable(true);
+    const auto refreshAutostart = [autostartAction] {
+        const bool enabled = Environment::isAutostartEnabled();
+        autostartAction->setChecked(enabled);
+        autostartAction->setText(enabled ? "\u2714 Autostart" : "\u2716 Autostart");
+        autostartAction->setToolTip(enabled ? "Autostart is enabled" : "Autostart is disabled");
+    };
+    refreshAutostart();
     toolbar_->addSeparator();
     QAction* quitAction = toolbar_->addAction("Quit");
     auto* content = new QWidget(this);
@@ -264,6 +278,13 @@ MainWindow::MainWindow(PipeWireContext& context)
     connect(addAction, &QPushButton::clicked, this, [this] { addChannel(); });
     connect(importAction, &QAction::triggered, this, [this] { importConfig(); });
     connect(exportAction, &QAction::triggered, this, [this] { exportConfig(); });
+    connect(setDefaultAction, &QAction::triggered, this, [this] { setDefaultConfig(); });
+    connect(autostartAction, &QAction::triggered, this, [this, refreshAutostart](bool checked) {
+        if (!Environment::setAutostart(checked, QCoreApplication::applicationFilePath().toStdString())) {
+            QMessageBox::warning(this, "Autostart failed", "Could not update the autostart entry.");
+        }
+        refreshAutostart();
+    });
     connect(quitAction, &QAction::triggered, qApp, &QApplication::quit);
     connect(operationWatcher_, &QFutureWatcher<UiOperationResult>::finished, this, [this] {
         const UiOperationResult result = operationWatcher_->result();
@@ -862,8 +883,21 @@ void MainWindow::addChannel() {
     });
 }
 
+static QString chooseConfigFile(QWidget* parent, const QString& title, const QString& startPath) {
+    QFileDialog dialog(parent, title, startPath.isEmpty() ? QDir::homePath() : startPath, "JSON config (*.json);;All files (*)");
+    dialog.setOption(QFileDialog::DontUseNativeDialog);
+    dialog.setAcceptMode(QFileDialog::AcceptOpen);
+    dialog.setFileMode(QFileDialog::ExistingFile);
+    dialog.setFilter(QDir::AllEntries | QDir::AllDirs | QDir::Hidden | QDir::NoDotAndDotDot);
+    dialog.setLabelText(QFileDialog::FileName, "File name or full path:");
+    if (dialog.exec() != QDialog::Accepted || dialog.selectedFiles().isEmpty()) {
+        return {};
+    }
+    return dialog.selectedFiles().front();
+}
+
 void MainWindow::importConfig() {
-    const QString path = QFileDialog::getOpenFileName(this, "Import Config", QString(), "JSON config (*.json)", nullptr, QFileDialog::DontUseNativeDialog);
+    const QString path = chooseConfigFile(this, "Import Config", QFileInfo(QString::fromStdString(Environment::settings.config)).absolutePath());
     if (path.isEmpty()) {
         return;
     }
@@ -896,12 +930,35 @@ void MainWindow::importConfig() {
     });
 }
 
+void MainWindow::setDefaultConfig() {
+    const QString path = chooseConfigFile(this, "Select Default Config", QFileInfo(QString::fromStdString(Environment::settings.config)).absolutePath());
+    if (path.isEmpty()) {
+        return;
+    }
+    try {
+        std::ifstream input(path.toStdString());
+        if (!input.is_open()) {
+            throw std::runtime_error("Could not open the selected file.");
+        }
+        const std::string json((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        ConfigHandler::fromJson(json);
+    } catch (const std::exception& error) {
+        QMessageBox::warning(this, "Set Default failed", QString::fromUtf8(error.what()));
+        return;
+    }
+    if (!Environment::setDefaultConfigPath(path.toStdString())) {
+        QMessageBox::warning(this, "Set Default failed", "Could not update settings.json.");
+        return;
+    }
+    statusBar()->showMessage("Default config set to " + path, 3500);
+}
+
 void MainWindow::exportConfig() {
     QFileDialog dialog(this, "Export Config", QDir::homePath(), "JSON config (*.json)");
     dialog.setOption(QFileDialog::DontUseNativeDialog);
     dialog.setAcceptMode(QFileDialog::AcceptSave);
     dialog.setFileMode(QFileDialog::AnyFile);
-    dialog.setFilter(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot);
+    dialog.setFilter(QDir::AllEntries | QDir::AllDirs | QDir::Hidden | QDir::NoDotAndDotDot);
     dialog.setLabelText(QFileDialog::FileName, "File name or full path:");
     dialog.selectFile("mymixer-config.json");
     QString path;
