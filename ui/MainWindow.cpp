@@ -262,7 +262,7 @@ MainWindow::MainWindow(PipeWireContext& context)
     virtualHostLayout->addWidget(virtualHeader);
     auto* virtualCards = new QWidget(virtualHost_);
     virtualCards->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-    virtualLayout_ = new FlowLayout(virtualCards, 0, 12, 3);
+    virtualLayout_ = new FlowLayout(virtualCards, 0, 12);
     virtualLayout_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
     virtualHostLayout->addWidget(virtualCards);
     workspaceLayout_->addWidget(hardwareHost_, 0);
